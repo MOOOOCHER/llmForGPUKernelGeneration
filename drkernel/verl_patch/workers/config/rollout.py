@@ -64,6 +64,9 @@ class MultiTurnConfig(BaseConfig):
     prompt_config_path: Optional[str] = None
     mask_void_turn: bool = True
     multi_iteration: Optional[dict] = None
+    # Mirrors reward_model.reward_func_name (via yaml interpolation) so the rollout
+    # engine can activate the fusion first-turn prompt when the fusion reward is used.
+    reward_func_name: Optional[str] = None
 
 
 @dataclass

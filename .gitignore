@@ -1,2 +1,20 @@
 data/
 .claude/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# macOS metadata
+._*
+.DS_Store
+
+# Runtime artifacts
+logs/
+outputs/
+dump.rdb
