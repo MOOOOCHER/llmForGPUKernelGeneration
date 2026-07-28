@@ -1,13 +1,25 @@
 method: system
 prompt: null
 
+# Appended to the initial user prompt only when the fusion reward is active
+# (calculate_reward_fusion, calculate_reward_speedup_fusion, or the CCSC fusion
+# reward) and the reference has plans. The engine fills {reference_fusion_plans}.
+fusion_first_turn_prompt: |
+  The following operator boundaries are independent fusion opportunities:
+  {reference_fusion_plans}
+
+  Fuse as many listed A -> B boundaries as are legal while preserving exact numerical correctness. A boundary is fused only when A and B are computed in the same executed Triton/CUDA kernel launch without materializing A's output for a later kernel. Kernel names, comments, and helper-function names do not count as fusion. Treat overlapping boundaries as separate opportunities: they may be incompatible, so do not assume they must be combined into one larger kernel.
+
 per_turn_prompts:
   - name: first_turn
     condition: "current_turn == 0"
     history_mode: all
     skip_env: 0.0
     response_truncation: python_code, answer_code
-    template: null
+    template: |
+      Precision requirement: for FP32 matrix multiplication or reductions implemented with `tl.dot`, use `tl.dot(..., input_precision="ieee")` unless the reference implementation explicitly permits TF32 or lower precision.
+
+      Return a Triton implementation named `ModelNew` as a single ```python``` block. Let's think step by step.
   - name: tool_response
     condition: "make_up_tool_response == True"
     history_mode: all
@@ -20,5 +32,7 @@ per_turn_prompts:
       Here is the server feedback. Please refer to this feedback to improve the implementation:
       Server feedback (status/metrics/errors):
       {feedback}
+
+      Precision requirement: for FP32 matrix multiplication or reductions implemented with `tl.dot`, use `tl.dot(..., input_precision="ieee")` unless the reference implementation explicitly permits TF32 or lower precision.
 
       Return an improved Triton implementation named `ModelNew` as a single ```python``` block. Let's think step by step.

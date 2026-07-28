@@ -905,7 +905,14 @@ def main(config):
 def run_generation(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray_init_kwargs = {}
+        ray_num_cpus = int(os.environ.get("RAY_NUM_CPUS", "0"))
+        if ray_num_cpus > 0:
+            ray_init_kwargs["num_cpus"] = ray_num_cpus
+        ray.init(
+            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}},
+            **ray_init_kwargs,
+        )
 
     return ray.get(main_task.remote(config))
 
@@ -1278,17 +1285,27 @@ def main_task(config):
 
         for i in range(batch_size):
             # Resolve Problem ID
+            # extra_info arrives as np.ndarray after DataProto collation, so a
+            # list-only isinstance check would silently fall through to
+            # prompt_index; accept any sequence.
             pid = None
+            level = None
             if "extra_info" in batch.non_tensor_batch:
                 extra_infos = batch.non_tensor_batch["extra_info"]
-                if isinstance(extra_infos, list) and len(extra_infos) > i:
+                if hasattr(extra_infos, "__len__") and len(extra_infos) > i:
                     item_extra = extra_infos[i]
                     if isinstance(item_extra, dict):
                             pid = item_extra.get("problem_id")
+                            level = item_extra.get("level")
 
             if pid is None:
                     p_indices = batch.non_tensor_batch.get('prompt_index')
                     pid = p_indices[i] if p_indices is not None else f"batch_unk_idx{i}"
+            elif level is not None:
+                # KernelBench problem ids repeat across levels, so a combined
+                # multi-level dataset needs level-qualified keys or the sample
+                # counters and eval_outputs directories collide across levels.
+                pid = f"level_{level}_problem_{pid}"
 
             if pid not in pid_uid_to_sample_id:
                 pid_uid_to_sample_id[pid] = {}
@@ -1502,8 +1519,12 @@ def main_task(config):
                 if (pid, uid) not in [(p, u) for p, u in problem_to_conversations[pid]]:
                     problem_to_conversations[pid].append((uid, sid))
 
-                # Multi-turn: Save in problem_X_sample_Y directory
-                conv_dir = os.path.join(eval_output_dir, f"problem_{pid}_sample_{sid}")
+                # Multi-turn: Save in problem_X_sample_Y directory. A
+                # level-qualified pid already carries its own prefix
+                # (level_X_problem_Y, the KernelBench exporter's primary
+                # pattern), so don't prepend problem_ again.
+                dir_stem = str(pid) if str(pid).startswith("level_") else f"problem_{pid}"
+                conv_dir = os.path.join(eval_output_dir, f"{dir_stem}_sample_{sid}")
                 os.makedirs(conv_dir, exist_ok=True)
 
                 # Save turn-specific files
@@ -1543,7 +1564,11 @@ def main_task(config):
                         f.write(str(ref_code_str))
             else:
                 # Single-turn: Use original flat structure
-                base_name = f"problem_{pid}_sample_{sid}"
+                base_name = (
+                    f"{pid}_sample_{sid}"
+                    if str(pid).startswith("level_")
+                    else f"problem_{pid}_sample_{sid}"
+                )
                 with open(os.path.join(eval_output_dir, f"{base_name}_kernel.py"), "w") as f:
                     f.write(code)
                 with open(os.path.join(eval_output_dir, f"{base_name}_ref.py"), "w") as f:

@@ -3303,11 +3303,40 @@ class RayKernelTrainer(RayPPOTrainer):
                         actual_input_ids_size = batch.batch["input_ids"].shape[0]
 
                         if actual_input_ids_size == 0:
+                            # Rejection sampling (MRS/PRS) discarded every rollout in
+                            # this batch. That is expected occasionally -- kernel
+                            # success rates are low, so a batch where nothing
+                            # compiled/passed carries no gradient signal. Skip the
+                            # batch instead of killing the run; trainer.max_skip_steps
+                            # bounds how many *consecutive* empty batches we tolerate
+                            # before treating it as a real problem (e.g. a broken
+                            # reward server) rather than bad luck.
+                            max_skips = int(
+                                self.config.trainer.get("max_skip_steps", 0) or 0
+                            )
+                            self._consecutive_empty_batches = (
+                                getattr(self, "_consecutive_empty_batches", 0) + 1
+                            )
+                            if self._consecutive_empty_batches <= max_skips:
+                                print(
+                                    "[skip_empty_batch] no valid samples after "
+                                    "filtering; skipping batch "
+                                    f"({self._consecutive_empty_batches}/{max_skips} "
+                                    f"consecutive). global_steps={self.global_steps} "
+                                    "(not advanced)."
+                                )
+                                continue
                             raise RuntimeError(
-                                "No valid samples were selected after filtering. "
+                                "No valid samples were selected after filtering for "
+                                f"{self._consecutive_empty_batches} consecutive batches "
+                                f"(trainer.max_skip_steps={max_skips}). "
                                 "Increase rollout number to ensure that there are valid examples for training."
                             )
-                        elif actual_input_ids_size < expected_input_ids_size:
+                        else:
+                            # Batch has usable samples: the streak is broken.
+                            self._consecutive_empty_batches = 0
+
+                        if actual_input_ids_size < expected_input_ids_size:
                             current_sample_factor = float(
                                 self.config.data.get("prompt_oversampling_factor", 1.0)
                             )

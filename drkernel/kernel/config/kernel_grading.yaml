@@ -221,6 +221,10 @@ actor_rollout_ref:
       # Path to per-turn prompt config
       prompt_config_path: kernel/config/prompt_config/multi_turn_kernel.yaml
 
+      # Mirrors the reward function so the engine can enable the fusion first-turn prompt
+      # (fusion_first_turn_prompt in the prompt config) only when the fusion reward is used
+      reward_func_name: ${reward_model.reward_func_name}
+
       # Whether to mask loss for void turns (no tool calls) in multi-turn training
       mask_void_turn: True
 
@@ -309,6 +313,18 @@ reward_model:
     reward_type: "time_coverage"
     enable: false
     weight: 0.25
+  fusion_reward:
+    # Reference-boundary launch assignment via DefragmentationFramework; used by fusion reward functions
+    enable: false
+    detector: "profiled_export"
+    resolved_weight: 0.25        # reference operator boundaries proven to share one custom launch
+    unresolved_weight: -0.1     # missing, ambiguous, split-launch, or unparsable boundaries are penalized
+    anchor_bonus_weight: 0.08    # per proven boundary adjacent to anchor_semantics: weight * min(count, anchor_bonus_cap)
+    anchor_bonus_cap: 4         # cap on the number of anchored resolved plans counted for the bonus
+    anchor_semantics: ["conv*", "linear"]  # "foo*" matches by prefix: conv* covers conv1d/2d/3d, conv_transpose*, ...
+    defrag_framework_path: null # defaults to the DefragmentationFramework checkout next to KernelGYM
+    print_plans: true           # print plans and proven/not-proven fusion boundaries per sample for debugging
+    # note: coverage also applies to calculate_reward_fusion via the coverage_reward block above (enable + weight)
 
   # Performance evaluation
   num_perf_trials: 100

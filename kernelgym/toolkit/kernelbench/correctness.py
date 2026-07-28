@@ -14,6 +14,26 @@ from kernelgym.toolkit.kernelbench.exec_types import (
 )
 
 
+def get_tolerance_for_precision(dtype: torch.dtype) -> float:
+    """Tolerance used for allclose, keyed on output precision.
+
+    Mirrors KernelBench's get_tolerance_for_precision (src/kernelbench/eval.py),
+    whose values come from torchbench. KernelBench v0/v0.1 used 1e-2 for every
+    precision; v0.2 tightened fp32 to 1e-4, so a flat 1e-2 here would grade fp32
+    kernels 100x more leniently than the benchmark the model is scored against.
+
+    Unlisted dtypes fall back to 1e-2 rather than raising: this runs inside the
+    RL reward path, where an unsupported dtype should grade as it always has
+    rather than crash the evaluation.
+    """
+    PRECISION_TOLERANCES = {
+        torch.float32: 1e-4,
+        torch.float16: 1e-2,
+        torch.bfloat16: 1e-2,
+    }
+    return PRECISION_TOLERANCES.get(dtype, 1e-2)
+
+
 def register_and_format_exception(
     exception_type: str,
     exception_msg: Exception | str,
@@ -89,11 +109,15 @@ def run_and_check_correctness(
                         compiled=True, correctness=False, metadata=metadata
                     )
 
-                if not torch.allclose(output, output_new, atol=1e-02, rtol=1e-02):
+                tolerance = get_tolerance_for_precision(output.dtype)
+                if not torch.allclose(
+                    output, output_new, atol=tolerance, rtol=tolerance
+                ):
                     max_diff = torch.max(torch.abs(output - output_new)).item()
                     avg_diff = torch.mean(torch.abs(output - output_new)).item()
                     metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
                     metadata.setdefault("avg_difference", []).append(f"{avg_diff:.6f}")
+                    metadata["tolerance"] = tolerance
                     metadata["correctness_issue"] = "Output mismatch"
                     if verbose:
                         print(f"[FAIL] trial {trial}: Output mismatch")

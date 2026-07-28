@@ -8,8 +8,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import redis.asyncio as redis
@@ -106,6 +110,92 @@ class TaskManager:
         self.worker_load_balancer = WorkerLoadBalancer()
         self.retry_manager = CodeRetryManager(redis_client)
         self._background_tasks: list[asyncio.Task] = []
+
+    def _task_archive_root(self) -> Optional[Path]:
+        archive_dir = str(getattr(settings, "task_archive_dir", "") or "").strip()
+        return Path(archive_dir).expanduser() if archive_dir else None
+
+    @staticmethod
+    def _archive_task_component(task_id: str, task_data: Optional[Dict[str, Any]] = None) -> str:
+        archive_id = str((task_data or {}).get("base_task_id") or task_id)
+        for suffix in ("_kernel", "_ref"):
+            if archive_id.endswith(suffix):
+                archive_id = archive_id[: -len(suffix)]
+                break
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", archive_id).strip("._") or "task"
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as archive_file:
+                archive_file.write(content)
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    async def _archive_submission(self, task_id: str, task_data: Dict[str, Any]) -> None:
+        archive_root = self._task_archive_root()
+        kernel_code = task_data.get("kernel_code")
+        if archive_root is None or kernel_code is None:
+            return
+
+        archive_dir = archive_root / self._archive_task_component(task_id, task_data)
+        request_data = {
+            key: value
+            for key, value in task_data.items()
+            if key not in {"kernel_code", "reference_code"}
+        }
+
+        def write_submission() -> None:
+            self._atomic_write(archive_dir / "kernel.py", str(kernel_code))
+            self._atomic_write(
+                archive_dir / "request.json",
+                json.dumps(request_data, indent=2, sort_keys=True, default=str) + "\n",
+            )
+
+        try:
+            await asyncio.to_thread(write_submission)
+        except Exception as error:
+            logger.warning("Failed to archive submission %s: %s", task_id, error)
+
+    async def _archive_result(
+        self,
+        task_id: str,
+        status: str,
+        timestamp_key: str,
+        timestamp: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        archive_root = self._task_archive_root()
+        if archive_root is None or task_id.endswith("_ref"):
+            return
+
+        task_data: Dict[str, Any] = {}
+        try:
+            stored_task = await self.redis.hgetall(f"{self.task_prefix}{task_id}")
+            task_data = self._load_task_json(stored_task) if stored_task else {}
+        except Exception as error:
+            logger.warning("Failed to load task metadata for archive %s: %s", task_id, error)
+
+        archive_dir = archive_root / self._archive_task_component(task_id, task_data)
+        filename = "kernel_result.json" if task_id.endswith("_kernel") else "result.json"
+        archive_payload = {
+            "task_id": task_id,
+            "status": status,
+            timestamp_key: timestamp,
+            **payload,
+        }
+        try:
+            await asyncio.to_thread(
+                self._atomic_write,
+                archive_dir / filename,
+                json.dumps(archive_payload, indent=2, sort_keys=True, default=str) + "\n",
+            )
+        except Exception as error:
+            logger.warning("Failed to archive result %s: %s", task_id, error)
 
     def _prefixes_for_read(self):
         prefixes = [self.key_prefix]
@@ -353,6 +443,7 @@ class TaskManager:
                 "assigned_at": assigned_at,
             },
         )
+        await self._archive_submission(task_id, task_data)
 
         if assigned_worker:
             worker_queue_key = f"{self.queue_prefix}worker:{assigned_worker}"
@@ -420,6 +511,13 @@ class TaskManager:
             f"{self.task_prefix}{task_id}",
             mapping={"status": TaskStatus.COMPLETED.value, "completed_at": completed_at},
         )
+        await self._archive_result(
+            task_id,
+            TaskStatus.COMPLETED.value,
+            "completed_at",
+            completed_at,
+            {"result": result},
+        )
         if task_id in self.active_tasks:
             self.active_tasks[task_id].status = TaskStatus.COMPLETED
             self.active_tasks[task_id].completed_at = datetime.fromisoformat(completed_at)
@@ -442,6 +540,14 @@ class TaskManager:
             f"{task_prefix}{task_id}",
             mapping={"status": TaskStatus.FAILED.value, "failed_at": failed_at},
         )
+        if prefix is None or prefix == self.key_prefix:
+            await self._archive_result(
+                task_id,
+                TaskStatus.FAILED.value,
+                "failed_at",
+                failed_at,
+                {"error_message": error_message, "error_code": error_code.value},
+            )
         if task_id in self.active_tasks:
             self.active_tasks[task_id].status = TaskStatus.FAILED
             self.active_tasks[task_id].error_message = error_message

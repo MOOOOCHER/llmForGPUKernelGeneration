@@ -6,6 +6,7 @@ import argparse
 import logging
 import sys
 import redis.asyncio as redis
+from redis.exceptions import BusyLoadingError, ConnectionError as RedisConnectionError
 
 from kernelgym.config import settings
 KEY_PREFIX = settings.redis_key_prefix
@@ -13,6 +14,21 @@ from kernelgym.config import setup_logging
 from kernelgym.worker.gpu_worker import GPUWorker
 
 logger = logging.getLogger("kernelgym.single_worker")
+
+
+async def wait_for_redis(redis_client, timeout_seconds=60.0, retry_interval=0.5):
+    """Wait until Redis accepts commands instead of exiting during startup."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        try:
+            await redis_client.ping()
+            return
+        except (BusyLoadingError, RedisConnectionError) as exc:
+            if loop.time() >= deadline:
+                raise
+            logger.warning("Redis not ready (%s). Retrying...", exc)
+            await asyncio.sleep(retry_interval)
 
 
 async def main():
@@ -28,7 +44,7 @@ async def main():
     
     # Initialize Redis connection
     redis_client = redis.from_url(settings.redis_url)
-    await redis_client.ping()
+    await wait_for_redis(redis_client)
     logger.info(f"Redis connection established for worker {args.worker_id}")
     
     # Create and start worker

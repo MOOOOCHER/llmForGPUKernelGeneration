@@ -161,12 +161,14 @@ TOP_K=${TOP_K:--1}
 ROLLOUT_N=${ROLLOUT_N:-16}
 KL_COEF=${KL_COEF:-0.0}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1000}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-null}   # null = derive from epochs
 ROLLOUT_GPU_MEMORY_UTIL=${ROLLOUT_GPU_MEMORY_UTIL:-0.75}
 ACTOR_OPTIMIZER_OFFLOAD=${ACTOR_OPTIMIZER_OFFLOAD:-False}
 ACTOR_PARAMETER_OFFLOAD=${ACTOR_PARAMETER_OFFLOAD:-False}
 MODEL_NAME=${MODEL_NAME:-Qwen3-8B-Base}
 SAVE_FREQ=${SAVE_FREQ:-10}
 TEST_FREQ=${TEST_FREQ:-10}
+MAX_CKPT_TO_KEEP=${MAX_CKPT_TO_KEEP:-null}   # null = keep every checkpoint
 REMOVE_CLIP=${REMOVE_CLIP:-False}
 ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE=${ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE:-1}
 FREE_CACHE_ENGINE=${FREE_CACHE_ENGINE:-True}
@@ -187,6 +189,12 @@ VAL_ONLY=${VAL_ONLY:-False}
 TRAIN_DATASET=${TRAIN_DATASET:-()}          # Array of training dataset paths
 VALID_DATASET=${VALID_DATASET:-()}          # Array of validation dataset paths
 REWARD_MANAGER=${REWARD_MANAGER:-"kernel_async"}        # Reward manager (e.g., "math", "code", "swe")
+# Baseline the generated kernel is timed against: "pytorch" (eager) or
+# "torch_compile". kernel_reward.py requires it, but only kernel_grading.yaml
+# declares it -- so on the RL path it must be added with '+', or every reward
+# fails with "Key 'reference_backend' is not in struct" and all samples are
+# filtered out. Same default as the eval path (grading_common.sh).
+REFERENCE_BACKEND=${REFERENCE_BACKEND:-"pytorch"}
 
 # Kernel reward-related defaults (can be overridden by task scripts or CLI)
 REWARD_SERVER_URL=${KERNELGYM_SERVER_URL:-""}
@@ -407,7 +415,9 @@ parse_arguments() {
       --actor_optimizer_offload) ACTOR_OPTIMIZER_OFFLOAD="$2"; shift 2 ;;
       --actor_parameter_offload) ACTOR_PARAMETER_OFFLOAD="$2"; shift 2 ;;
       --total_epochs) TOTAL_EPOCHS="$2"; shift 2 ;;
+      --total_training_steps) TOTAL_TRAINING_STEPS="$2"; shift 2 ;;
       --save_freq) SAVE_FREQ="$2"; shift 2 ;;
+      --max_ckpt_to_keep) MAX_CKPT_TO_KEEP="$2"; shift 2 ;;
       --test_freq) TEST_FREQ="$2"; shift 2 ;;
       --remove_clip) REMOVE_CLIP="$2"; shift 2 ;;
       --apply_chat_template) APPLY_CHAT_TEMPLATE="$2"; shift 2 ;;
@@ -423,6 +433,7 @@ parse_arguments() {
       --solverate_ratio) SOLVERATE_RATIO="$2"; shift 2 ;;
       --solverate_mean_std) SOLVERATE_MEAN_STD="$2"; shift 2 ;;
       --reward_manager) REWARD_MANAGER="$2"; shift 2 ;;
+      --reference_backend) REFERENCE_BACKEND="$2"; shift 2 ;;
       --reward_server_url) REWARD_SERVER_URL="$2"; shift 2 ;;
       --reward_enhanced) REWARD_ENHANCED="$2"; shift 2 ;;
       --reward_use_sandbox_rate_limit) REWARD_USE_SANDBOX_RATE_LIMIT="$2"; shift 2 ;;
@@ -615,7 +626,9 @@ setup_training_environment() {
     MODEL_PATH_RESOLVED="$MODEL_NAME"
   fi
 
-  if [[ -n "${HDFS_CHECKPOINT_PATH}" ]]; then
+  if [[ -n "${CHECKPOINT_DIR_OVERRIDE:-}" ]]; then
+    CHECKPOINT_DIR="${CHECKPOINT_DIR_OVERRIDE}"
+  elif [[ -n "${HDFS_CHECKPOINT_PATH}" ]]; then
     CHECKPOINT_DIR="${HDFS_CHECKPOINT_PATH}/${RUN_NAME}"
   else
     CHECKPOINT_DIR="checkpoints/${RUN_NAME}"
@@ -765,6 +778,7 @@ run_training() {
       actor_rollout_ref.ref.ulysses_sequence_parallel_size=$SP_SIZE\
       reward_model.enable=False \
       reward_model.reward_manager=$REWARD_MANAGER \
+      +reward_model.reference_backend=$REFERENCE_BACKEND \
       reward_model.enhanced=$REWARD_ENHANCED \
       reward_model.use_sandbox_rate_limit=$REWARD_USE_SANDBOX_RATE_LIMIT \
       reward_model.server_url='"'$REWARD_SERVER_URL'"' \
@@ -811,9 +825,11 @@ run_training() {
       trainer.validation_data_dir=$VALIDATION_DATA_DIR \
       trainer.log_val_generations=10 \
       trainer.save_freq=$SAVE_FREQ \
+      trainer.max_actor_ckpt_to_keep=$MAX_CKPT_TO_KEEP \
       trainer.test_freq=$TEST_FREQ \
       trainer.default_local_dir=$CHECKPOINT_DIR \
       trainer.total_epochs=$TOTAL_EPOCHS \
+      trainer.total_training_steps=$TOTAL_TRAINING_STEPS \
       trainer.val_only=$VAL_ONLY \
       trainer.max_skip_steps=$MAX_SKIP_STEPS \
       rejection_sampling.enable_two_gate_filter=$ENABLE_TWO_GATE_FILTER \

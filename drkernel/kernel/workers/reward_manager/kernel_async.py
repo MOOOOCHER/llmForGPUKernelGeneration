@@ -304,6 +304,11 @@ class AsyncKernelRewardManager:
         if total_kernel_run_time_in_profiling_us > 0:
             time_coverage = custom_kernel_cuda_time_in_profiling_us / total_kernel_run_time_in_profiling_us
         reward_extra_info["time_coverage"] = float(f"{time_coverage:.2f}")
+        for key, value in results.items():
+            if key.startswith("fusion_") and isinstance(
+                value, (bool, int, float, str, type(None))
+            ):
+                reward_extra_info[key] = value
 
         # reward_extra_info["correctness"].append(correctness)
         # reward_extra_info["performance"].append(speedup)

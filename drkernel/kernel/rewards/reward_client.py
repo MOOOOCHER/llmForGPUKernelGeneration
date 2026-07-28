@@ -14,8 +14,12 @@ Invariant: task_timeout_in_client >= task_timeout (client waits longer due to qu
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 import logging
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import random
 from uuid import uuid4
@@ -24,6 +28,8 @@ import httpx
 import ray
 
 from verl.tools.sandbox_fusion_tools import TokenBucketWorker
+
+from kernel.rewards.fusion_helper import DEFAULT_ANCHOR_SEMANTICS, compute_fusion_reward
 
 
 logger = logging.getLogger(__name__)
@@ -189,6 +195,29 @@ class KernelRewardClient:
         self.penalty_score = float(reward_config.reward_policy.penalties.penalty_score)
         self.speedup_reward_upper_bound = float(reward_config.speedup_reward_upper_bound)
         self.speedup_reward_lower_bound = float(reward_config.speedup_reward_lower_bound)
+
+        # Fusion reward component (defragmentation fusion-plan comparison).
+        fusion_cfg = getattr(reward_config, "fusion_reward", None)
+        self.fusion_resolved_weight = float(getattr(fusion_cfg, "resolved_weight", 0.25))
+        self.fusion_unresolved_weight = float(getattr(fusion_cfg, "unresolved_weight", -0.1))
+        self.fusion_anchor_bonus_weight = float(getattr(fusion_cfg, "anchor_bonus_weight", 0.08))
+        self.fusion_anchor_bonus_cap = int(getattr(fusion_cfg, "anchor_bonus_cap", 4))
+        anchor_semantics = getattr(fusion_cfg, "anchor_semantics", None)
+        self.fusion_anchor_semantics = (
+            [str(s) for s in anchor_semantics] if anchor_semantics else list(DEFAULT_ANCHOR_SEMANTICS)
+        )
+        self.fusion_defrag_framework_path = getattr(fusion_cfg, "defrag_framework_path", None)
+        self.fusion_detector = str(getattr(fusion_cfg, "detector", "profiled_export"))
+        self.fusion_print_plans = bool(getattr(fusion_cfg, "print_plans", True))
+        # Fusion is active when a fusion reward function is selected or explicitly enabled.
+        self.fusion_reward_enable = bool(getattr(fusion_cfg, "enable", False)) or (
+            str(self.reward_func_name) in self._FUSION_REWARD_FUNC_NAMES
+        )
+        if self.fusion_resolved_weight <= self.fusion_unresolved_weight:
+            print(
+                f"[HybridClient] WARNING: fusion resolved_weight ({self.fusion_resolved_weight}) should be > "
+                f"unresolved_weight ({self.fusion_unresolved_weight}) to promote fusion"
+            )
 
     def _get_reward_func(self):
         """Select reward function based on config; default to calculate_reward_like_kernel."""
@@ -541,6 +570,249 @@ class KernelRewardClient:
             "custom_kernel_cuda_time_in_profiling_us": custom_kernel_cuda_time_in_profiling_us,
             "total_kernel_run_time_in_profiling_us": total_kernel_run_time_in_profiling_us,
         }
+    
+    def calculate_reward_compile_correct_speedup_coverage(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Custom shaped reward with explicit compile/correctness terms.
+
+        reward = (+0.1 if compiled else -1)
+               + (+0.5 if correct else -0.5)
+               + performance_weight * clip(speedup, lower_bound, 3)
+               + coverage_weight * coverage, when coverage reward is enabled.
+        """
+        if result.get("status") != "completed":
+            error_message = result.get("error_message", "Task failed")
+            if error_message == "Task failed":
+                error_message = result.get("error", "Task failed")
+            print(f"[HybridClient] calculate_reward_compile_correct_speedup_coverage error_message: {error_message}")
+            print(f"[HybridClient] Task failed result: {result}")
+
+            return_result = {
+                "reward": -1.5,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "error": error_message,
+                "score": -1.5,
+            }
+
+            for key in result.keys():
+                if key not in return_result:
+                    return_result[key] = result[key]
+
+            return return_result
+
+        if result.get("decoy_kernel", False):
+            try:
+                print("[HybridClient] decoy_kernel detected; forcing compile/correctness penalties")
+            except Exception:
+                pass
+            return {
+                "reward": -1.5,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "decoy_kernel": True,
+                "error": "Reward hacking: Decoy kernel detected",
+                "score": -1.5,
+            }
+
+        correctness = bool(result.get("correctness", False))
+        compiled = bool(result.get("compiled", False))
+        speedup = result.get("speedup", 0.0)
+        profiling = result.get("profiling", None)
+
+        if speedup is None:
+            speedup = 0.0
+
+        compile_reward = 0.1 if compiled else -1.0
+        correctness_reward = 0.5 if correctness else -0.5
+        reward_speedup = min(float(speedup), 3.0)
+        if reward_speedup < self.speedup_reward_lower_bound:
+            reward_speedup = 0.0
+        speedup_reward = self.init_performance_weight * reward_speedup
+
+        coverage = 0.0
+        num_custom_kernel = 0
+        num_total_kernels = 0
+        custom_kernel_cuda_time_in_profiling_us = 0
+        total_kernel_run_time_in_profiling_us = 0
+
+        coverage_dict = self.compute_coverage_reward(result)
+        coverage = coverage_dict["coverage"]
+        num_custom_kernel = coverage_dict["num_custom_kernel"]
+        num_total_kernels = coverage_dict["num_total_kernels"]
+        custom_kernel_cuda_time_in_profiling_us = coverage_dict["custom_kernel_cuda_time_in_profiling_us"]
+        total_kernel_run_time_in_profiling_us = coverage_dict["total_kernel_run_time_in_profiling_us"]
+
+        coverage_reward = 0.0
+        if self.reward_config.coverage_reward.enable:
+            coverage_reward = self.reward_config.coverage_reward.weight * coverage
+
+        final_reward = compile_reward + correctness_reward + speedup_reward + coverage_reward
+
+        return {
+            "reward": final_reward,
+            "speedup": speedup,
+            "success": compiled and correctness,
+            "correctness": correctness,
+            "compiled": compiled,
+            "score": final_reward,
+            "profiling": profiling,
+            "num_custom_kernel": num_custom_kernel,
+            "num_total_kernels": num_total_kernels,
+            "custom_kernel_cuda_time_in_profiling_us": custom_kernel_cuda_time_in_profiling_us,
+            "total_kernel_run_time_in_profiling_us": total_kernel_run_time_in_profiling_us,
+            "compile_reward": compile_reward,
+            "correctness_reward": correctness_reward,
+            "speedup_reward": speedup_reward,
+            "coverage_reward": coverage_reward,
+        }
+    
+    # Reward functions that consume the fusion-plan component; compute_batch_rewards
+    # attaches _fusion_reference_code/_fusion_kernel_code only for these.
+    _FUSION_REWARD_FUNC_NAMES = (
+        "calculate_reward_fusion",
+        "calculate_reward_speedup_fusion",
+        "calculate_reward_compile_correct_speedup_coverage_fusion",
+    )
+
+    def calculate_reward_fusion(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Weighted base reward plus a fusion-plan component.
+
+        The base comes from calculate_reward_weighted, which already includes
+        the optional coverage component when reward_model.coverage_reward.enable
+        is set (+ coverage_reward.weight * coverage, correct kernels only).
+
+        Fusion plans from the reference define adjacent operator boundaries.
+        Reference semantics are assigned to generated launch nodes using visible
+        graph anchors and name-independent custom-kernel residual assignment:
+
+            fusion = proven_fused_ratio * resolved_weight
+                   + not_proven_fused_ratio * unresolved_weight
+                   + anchor_bonus_weight * min(proven anchored boundaries, cap)
+
+        Fusion plans are computed and printed for every generated kernel (for
+        debugging via the log/out file), but the component is only added to the
+        reward for correct kernels, to avoid rewarding well-fused but wrong code.
+        """
+        reference_code = result.pop("_fusion_reference_code", "")
+        kernel_code = result.pop("_fusion_kernel_code", "")
+        summary = self.calculate_reward_weighted(result)
+        return self._apply_fusion_component(result, summary, reference_code, kernel_code)
+
+    def calculate_reward_speedup_fusion(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Capped continuous speedup reward plus the fusion-plan component."""
+        reference_code = result.pop("_fusion_reference_code", "")
+        kernel_code = result.pop("_fusion_kernel_code", "")
+        summary = self.calculate_reward_speedup(result)
+        return self._apply_fusion_component(result, summary, reference_code, kernel_code)
+
+    def calculate_reward_compile_correct_speedup_coverage_fusion(
+        self, result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Dense shaped base (compile/correct/speedup/coverage) plus the
+        fusion-plan component, applied under the same policy as
+        calculate_reward_fusion (correct kernels only)."""
+        reference_code = result.pop("_fusion_reference_code", "")
+        kernel_code = result.pop("_fusion_kernel_code", "")
+        summary = self.calculate_reward_compile_correct_speedup_coverage(result)
+        return self._apply_fusion_component(result, summary, reference_code, kernel_code)
+
+    def _apply_fusion_component(
+        self,
+        result: Dict[str, Any],
+        summary: Dict[str, Any],
+        reference_code: str,
+        kernel_code: str,
+    ) -> Dict[str, Any]:
+        task_id = result.get("task_id", "")
+        correctness = bool(summary.get("correctness", False))
+
+        fusion_info = compute_fusion_reward(
+            reference_code,
+            kernel_code,
+            resolved_weight=self.fusion_resolved_weight,
+            unresolved_weight=self.fusion_unresolved_weight,
+            anchor_bonus_weight=self.fusion_anchor_bonus_weight,
+            anchor_bonus_cap=self.fusion_anchor_bonus_cap,
+            anchor_semantics=self.fusion_anchor_semantics,
+            defrag_framework_path=self.fusion_defrag_framework_path,
+            correctness=correctness,
+            profiler_metadata=result.get("metadata", {}),
+            detector=self.fusion_detector,
+        )
+        # Only correct kernels earn the fusion component.
+        fusion_plan_artifact = fusion_info.pop("fusion_plan_artifact", None)
+        fusion_info["fusion_reward_applied"] = fusion_info["fusion_reward"] if correctness else 0.0
+        summary["reward"] = summary["reward"] + fusion_info["fusion_reward_applied"]
+        summary["score"] = summary["reward"]
+        self._write_fusion_plan_artifact(
+            task_id, fusion_plan_artifact
+        )
+
+        if self.fusion_print_plans:
+            try:
+                print(
+                    f"[HybridClient] fusion task_id={task_id} correct={correctness} "
+                    f"proven_fused={fusion_info['fusion_proven_fused_count']}/{fusion_info['fusion_reference_boundary_count']} "
+                    f"not_fused={fusion_info['fusion_not_fused_count']} "
+                    f"unknown={fusion_info['fusion_unknown_count']} "
+                    f"truncated={fusion_info['fusion_analysis_truncated']} "
+                    f"anchor_proven={fusion_info['fusion_proven_fused_anchor_count']} "
+                    f"fusion_reward={fusion_info['fusion_reward']:.4f} "
+                    f"applied={fusion_info['fusion_reward_applied']:.4f} "
+                    f"error={fusion_info['fusion_error']}\n"
+                    f"[HybridClient]   reference plans:  {fusion_info['fusion_reference_plans']}\n"
+                    f"[HybridClient]   generated plans:  {fusion_info['fusion_generated_plans']}\n"
+                    f"[HybridClient]   proven boundaries:     {fusion_info['fusion_proven_fused_boundaries']}\n"
+                    f"[HybridClient]   not-fused boundaries:  {fusion_info['fusion_not_fused_boundaries']}\n"
+                    f"[HybridClient]   unknown boundaries:    {fusion_info['fusion_unknown_boundaries']}"
+                )
+            except Exception:
+                pass
+
+        summary.update(fusion_info)
+        return summary
+
+    @staticmethod
+    def _write_fusion_plan_artifact(
+        task_id: str, artifact: Optional[Dict[str, Any]]
+    ) -> None:
+        archive_root = os.environ.get("KERNELGYM_TASK_ARCHIVE_DIR", "").strip()
+        if not archive_root or not task_id or not isinstance(artifact, dict):
+            return
+        archive_id = str(task_id)
+        for suffix in ("_kernel", "_ref"):
+            if archive_id.endswith(suffix):
+                archive_id = archive_id[: -len(suffix)]
+                break
+        archive_id = "".join(
+            character
+            if character.isalnum() or character in "._-"
+            else "_"
+            for character in archive_id
+        ).strip("._") or "task"
+        destination = Path(archive_root).expanduser() / archive_id / "fusion_plans.json"
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".fusion_plans.", dir=destination.parent
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as artifact_file:
+                json.dump(artifact, artifact_file, indent=2, sort_keys=True, default=str)
+                artifact_file.write("\n")
+            os.replace(temporary_path, destination)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to write fusion plan artifact for %s: %s", task_id, exc
+            )
+            try:
+                if "temporary_path" in locals() and os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
+            except OSError:
+                pass
 
     def _merge_reward_result(self, raw_result: Dict[str, Any], reward_summary: Dict[str, Any]) -> Dict[str, Any]:
         """Merge raw KernelServer response payload with derived reward summary."""
@@ -654,11 +926,12 @@ class KernelRewardClient:
                 print(f"Enforce detect decoy kernel if validate: {payload['detect_decoy_kernel']}")
                 payload["detect_decoy_kernel"] = True
 
+            # The server rejects cache-enabled tasks without a uuid, so only
+            # request caching when we can key it.
             ucache = task.get("use_reference_cache", use_reference_cache)
-            if ucache:
+            if ucache and task.get("uuid"):
                 payload["use_reference_cache"] = True
-                if task.get("uuid"):
-                    payload["uuid"] = task["uuid"]
+                payload["uuid"] = task["uuid"]
             
             # Record task metadata for heartbeat tracking.
             obj_ref_idx = len(obj_refs)  # Index of the obj_ref about to be appended to the list.
@@ -735,6 +1008,11 @@ class KernelRewardClient:
         for idx_in_obj, data in results:
             orig_idx = index_map[idx_in_obj]
             reward_func = self._get_reward_func()
+            if getattr(reward_func, "__name__", "") in self._FUSION_REWARD_FUNC_NAMES and isinstance(data, dict):
+                # Fusion plan comparison needs the original codes; the reward
+                # function pops these keys so they never leak into the output.
+                data["_fusion_reference_code"] = tasks[orig_idx].get("reference_code", "")
+                data["_fusion_kernel_code"] = tasks[orig_idx].get("kernel_code", "")
             reward_summary = reward_func(data)
             merged[orig_idx] = self._merge_reward_result(data, reward_summary)
         # Fallback for any missing entries.

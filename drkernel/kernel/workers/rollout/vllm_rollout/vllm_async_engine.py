@@ -50,6 +50,7 @@ from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
 
 
+from kernel.rewards.fusion_helper import reference_fusion_plans_text
 from kernel.workers.agent import BaseAgent, KernelAgent
 from verl_patch.workers.code.agent_env import (
     BaseEnv,
@@ -1093,6 +1094,22 @@ class MultiTurnAsyncvLLMEngine:
     def load_per_turn_prompts(self) -> dict[str, dict[str, Any]]:
         """Load turn selection rules for the multi-turn agent loop."""
         per_turn_prompts = {}
+        self.fusion_first_turn_prompt = None
+        # The fusion guidance prompt is only used when the fusion reward is selected.
+        reward_func_name = str(
+            self.config.rollout.multi_turn.get("reward_func_name", "") or ""
+        )
+        fusion_prompt_enabled = os.environ.get("FUSION_PROMPT_ENABLED", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.fusion_reward_active = fusion_prompt_enabled or reward_func_name in {
+            "calculate_reward_fusion",
+            "calculate_reward_speedup_fusion",
+            "calculate_reward_compile_correct_speedup_coverage_fusion",
+        }
 
         # Get prompt config path from config, with fallback to default
         prompt_config_path = self.config.rollout.multi_turn.get("prompt_config_path", None)
@@ -1102,6 +1119,10 @@ class MultiTurnAsyncvLLMEngine:
         # Load from configured path
         with open(prompt_config_path, encoding='utf-8') as fp:
             prompt_cfg = OmegaConf.create(fp.read())
+
+        self.fusion_first_turn_prompt = prompt_cfg.get("fusion_first_turn_prompt", None)
+        if self.fusion_reward_active and self.fusion_first_turn_prompt:
+            print("[MultiTurnEngine] fusion reward active: first-turn prompts will include reference fusion plans")
 
         for prompt_config in prompt_cfg.per_turn_prompts:
             per_turn_prompts[prompt_config.name] = {
@@ -1114,6 +1135,29 @@ class MultiTurnAsyncvLLMEngine:
             }
 
         return per_turn_prompts
+
+    def maybe_inject_fusion_guidance(
+        self, messages: list[dict[str, Any]], ground_truth: str
+    ) -> list[dict[str, Any]]:
+        """Append reference fusion-plan guidance to the initial user prompt.
+
+        Only active when the fusion reward function is selected; the guidance is
+        injected once, before the request is created, so it stays part of the
+        conversation history for every turn. Samples whose reference has no
+        fusion plans (or cannot be analyzed) are left unchanged.
+        """
+        if not getattr(self, "fusion_reward_active", False) or not self.fusion_first_turn_prompt:
+            return messages
+        if not messages or messages[-1].get("role") != "user":
+            return messages
+        plans_text = reference_fusion_plans_text(ground_truth or "")
+        if plans_text is None:
+            return messages
+        guidance = str(self.fusion_first_turn_prompt).replace("{reference_fusion_plans}", plans_text)
+        # Copy the list and the mutated message so the caller's structures stay untouched.
+        messages = list(messages)
+        messages[-1] = {**messages[-1], "content": f'{messages[-1]["content"]}\n\n{guidance}'}
+        return messages
 
     def log_multiturn_messages(
         self,
@@ -1785,7 +1829,10 @@ class MultiTurnAsyncvLLMEngine:
         # env_done = current_turn_count >= self.max_agent_turns
         env_done = current_turn_count >= actual_max_turns
 
-        print(f"Env Result: {env_result}")
+        print(
+            "Env Result: "
+            f"reward={turn_reward}, done={env_done}, truncate={truncate}"
+        )
 
 
         return (
@@ -1833,6 +1880,10 @@ class MultiTurnAsyncvLLMEngine:
         # env = create_environment(self.env_type, self.max_agent_turns, extra_info)
         env = create_environment(self.env_type, actual_max_turns, extra_info)
         await env.reset(extra_info)
+
+        # When the fusion reward is active, extend the initial user prompt with the
+        # reference fusion plans so the guidance is part of every turn's history.
+        messages = self.maybe_inject_fusion_guidance(messages, ground_truth)
 
         # Initialize agent request
         req = MultiTurnRequest(

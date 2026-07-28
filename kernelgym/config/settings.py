@@ -109,6 +109,11 @@ class Settings(BaseSettings):
         env="EVAL_RESULTS_PATH",
         description="JSONL file path for persisted evaluation results.",
     )
+    task_archive_dir: str = Field(
+        default="",
+        validation_alias="KERNELGYM_TASK_ARCHIVE_DIR",
+        description="Optional directory for per-task source and result archives.",
+    )
     metrics_port: int = Field(default=8001, env="METRICS_PORT")
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
     worker_monitor_interval: int = Field(default=30, env="WORKER_MONITOR_INTERVAL")

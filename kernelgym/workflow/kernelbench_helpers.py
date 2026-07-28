@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import threading
+from collections import OrderedDict
 from typing import Any, Optional, Tuple
 
 from .kernelbench_types import (
@@ -13,7 +16,48 @@ from .kernelbench_types import (
     ReferenceTimingTask,
 )
 
-_reference_cache: Any = None
+
+class InMemoryReferenceCache:
+    """Thread-safe LRU cache of reference runtimes.
+
+    Keyed by (uuid, sha256(reference_code), is_valid) so a uuid reused with
+    different reference code can never return a stale runtime. Runtimes are
+    device-dependent; this cache assumes a homogeneous eval GPU pool, which
+    holds for the per-node KernelGYM deployment.
+    """
+
+    def __init__(self, max_entries: int = 100_000):
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[Tuple[str, str, bool], float] = OrderedDict()
+
+    @staticmethod
+    def _key(uuid: str, reference_code: str, is_valid: bool) -> Tuple[str, str, bool]:
+        code_hash = hashlib.sha256((reference_code or "").encode()).hexdigest()
+        return (uuid, code_hash, bool(is_valid))
+
+    def get(self, uuid: Optional[str], reference_code: str, is_valid: bool) -> Optional[float]:
+        if not uuid:
+            return None
+        key = self._key(uuid, reference_code, is_valid)
+        with self._lock:
+            runtime = self._entries.get(key)
+            if runtime is not None:
+                self._entries.move_to_end(key)
+            return runtime
+
+    def put(self, uuid: Optional[str], reference_code: str, is_valid: bool, runtime: float) -> None:
+        if not uuid or runtime is None or runtime <= 0:
+            return
+        key = self._key(uuid, reference_code, is_valid)
+        with self._lock:
+            self._entries[key] = float(runtime)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+_reference_cache: Any = InMemoryReferenceCache()
 
 
 def set_reference_cache(cache: Any) -> None:
@@ -28,6 +72,14 @@ def _get_cached_reference_runtime(
     if _reference_cache is None:
         return None
     return _reference_cache.get(uuid, reference_code, is_valid)
+
+
+def _store_reference_runtime(
+    uuid: Optional[str], reference_code: str, is_valid: bool, runtime: float
+) -> None:
+    if _reference_cache is None or not hasattr(_reference_cache, "put"):
+        return
+    _reference_cache.put(uuid, reference_code, is_valid, runtime)
 
 
 def _validate_code(code: str, entry_point: str = "Model") -> Tuple[bool, str]:

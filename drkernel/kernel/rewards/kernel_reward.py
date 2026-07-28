@@ -60,34 +60,63 @@ def extract_reference_code(solution_str: str) -> str:
     return solution_str
 
 
-def extract_kernel_code(solution_str: str) -> str:
+_CODE_FENCE_RE = re.compile(r"```[^\S\n]*[\w+-]*[^\S\n]*\n(.*?)```", re.DOTALL)
+_FENCE_OPEN_RE = re.compile(r"```[^\S\n]*[\w+-]*[^\S\n]*\n")
+
+
+def _fenced_code_blocks(text: str) -> list:
+    """All fenced code blocks, plus a trailing unclosed fence if present
+    (truncated response or missing closing fence)."""
+    blocks = _CODE_FENCE_RE.findall(text)
+    last_open = None
+    for m in _FENCE_OPEN_RE.finditer(text):
+        last_open = m
+    if last_open and "```" not in text[last_open.end():]:
+        tail = text[last_open.end():].strip()
+        if tail:
+            blocks.append(tail)
+    return blocks
+
+
+def extract_kernel_code(solution_str: str, entry_point: str = "Model") -> str:
     """
     从解决方案字符串中提取内核代码
-    
+
     Args:
         solution_str: 包含提示和响应的完整字符串
-        
+        entry_point: 参考模型入口类名；提交的内核必须定义 class {entry_point}New
+
     Returns:
         提取的内核代码
     """
-    # 查找内核实现标记
+    solution_str = solution_str or ""
+    required = f"class {entry_point}New"
+
+    # 优先选择最后一个真正定义 {entry_point}New 的代码块，避免模型在完整实现
+    # 之后追加的用法示例/片段代码块被误选（这是 preflight "missing class
+    # ModelNew" 失败的主要来源）。
+    blocks = _fenced_code_blocks(solution_str)
+    for block in reversed(blocks):
+        if required in block:
+            return block.strip()
+
+    # 查找内核实现标记（仅当标记内容确实包含目标类时才可信，防止 markdown
+    # 标题误匹配把散文当代码返回）
     patterns = [
         r"# Kernel Implementation\s*\n(.*?)(?=# End|$)",
         r"```python\s*# Kernel\s*\n(.*?)```",
         r"# Your implementation:\s*\n(.*?)(?=# End|$)",
         r"# Generated kernel:\s*\n(.*?)(?=# End|$)",
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, solution_str, re.DOTALL)
-        if match:
+        if match and required in match.group(1):
             return match.group(1).strip()
-    
+
     # 如果没有找到特定标记，尝试提取最后一个代码块
-    code_blocks = re.findall(r"```(?:\w+)?\s*\n?(.*?)```", solution_str, re.DOTALL)
-    if code_blocks:
-        return code_blocks[-1].strip()
-    
+    if blocks:
+        return blocks[-1].strip()
+
     # 回退：假设整个响应就是内核代码
     return solution_str
 
@@ -131,8 +160,8 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
         for i, solution_str in enumerate(solution_strs):
             # reference_code = extract_reference_code(solution_str)
             reference_code = ground_truths[i]
-            kernel_code = extract_kernel_code(solution_str)
             entry_point = entry_points[i]
+            kernel_code = extract_kernel_code(solution_str, entry_point=entry_point or "Model")
 
             if uuids is not None:
                 uuid = uuids[i]
@@ -143,7 +172,9 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
                 "reference_code": reference_code,
                 "kernel_code": kernel_code,
                 "entry_point": entry_point,
-                "use_reference_cache": False,
+                # Rollouts of the same prompt share a reference; cache its timing
+                # server-side (keyed by uuid + code hash, only used when uuid set).
+                "use_reference_cache": True,
                 "uuid": uuid if uuids is not None else "",
                 "is_valid": is_valid,
                 "task_timeout": task_timeout,
@@ -181,8 +212,8 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
         
         # 调用时传递 task_timeout
         results = loop.run_until_complete(
-            client.compute_batch_rewards(tasks, use_reference_cache=False, 
-                                       is_valid=is_valid, task_timeout=task_timeout, 
+            client.compute_batch_rewards(tasks, use_reference_cache=True,
+                                       is_valid=is_valid, task_timeout=task_timeout,
                                        task_timeout_in_client=task_timeout_in_client)
         )
         

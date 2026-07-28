@@ -99,6 +99,7 @@ def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
+            num_cpus=int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1)),
             runtime_env={
                 'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN', 'VLLM_LOGGING_LEVEL': 'WARN'}
             }

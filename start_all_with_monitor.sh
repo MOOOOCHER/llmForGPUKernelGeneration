@@ -7,7 +7,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTO_CONFIGURE="${ROOT_DIR}/scripts/auto_configure.sh"
-ENV_FILE="${ROOT_DIR}/.env"
+ENV_FILE="${KERNELGYM_ENV_FILE:-${ROOT_DIR}/.env}"
+PID_FILE=""
 
 LOG_DIR=""
 LOG_DIR_OVERRIDE=""
@@ -25,6 +26,22 @@ while [[ $# -gt 0 ]]; do
             LOG_DIR_OVERRIDE="${1#*=}"
             shift 1
             ;;
+        --env-file)
+            ENV_FILE="$2"
+            shift 2
+            ;;
+        --env-file=*)
+            ENV_FILE="${1#*=}"
+            shift 1
+            ;;
+        --pid-file)
+            PID_FILE="$2"
+            shift 2
+            ;;
+        --pid-file=*)
+            PID_FILE="${1#*=}"
+            shift 1
+            ;;
         --use-indexed-ports)
             AUTO_CONFIGURE_ARGS+=("--use-indexed-ports")
             shift 1
@@ -39,6 +56,21 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+WORKER_PIDS=()
+write_pid_file() {
+    if [ -z "${PID_FILE}" ]; then
+        return
+    fi
+    mkdir -p "$(dirname "${PID_FILE}")"
+    {
+        [ -n "${API_PID:-}" ] && echo "${API_PID}"
+        [ -n "${MONITOR_PID:-}" ] && echo "${MONITOR_PID}"
+        for pid in "${WORKER_PIDS[@]}"; do
+            echo "${pid}"
+        done
+    } > "${PID_FILE}"
+}
 
 if [ ! -f "${ENV_FILE}" ]; then
     echo "No .env found. Running auto configuration..."
@@ -110,11 +142,13 @@ echo "Starting API server..."
 python -m kernelgym.server.api.server > "${ROOT_DIR}/${LOG_DIR}/api_server.log" 2>&1 &
 API_PID=$!
 echo "API server PID: ${API_PID}"
+write_pid_file
 
 echo "Starting worker monitor..."
 python -m kernelgym.worker.worker_monitor --persistent > "${ROOT_DIR}/${LOG_DIR}/worker_monitor.log" 2>&1 &
 MONITOR_PID=$!
 echo "Worker monitor PID: ${MONITOR_PID}"
+write_pid_file
 
 sleep 2
 
@@ -159,6 +193,8 @@ for gpu in ${GPU_LIST}; do
         --persistent \
         > "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
     WORKER_PID=$!
+    WORKER_PIDS+=("${WORKER_PID}")
+    write_pid_file
 
     if command -v redis-cli >/dev/null 2>&1; then
         redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" "${REDIS_AUTH_ARGS[@]}" --no-auth-warning \

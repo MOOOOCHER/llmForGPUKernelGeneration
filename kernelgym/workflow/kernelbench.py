@@ -20,6 +20,7 @@ from .kernelbench_helpers import (
     _combine_results,
     _create_paired_tasks,
     _get_cached_reference_runtime,
+    _store_reference_runtime,
     _validate_code,
 )
 
@@ -170,6 +171,13 @@ class KernelBenchWorkflowController(WorkflowController):
                     self._persist_result(eval_task, result)
                     return result
                 ref_result = ReferenceTimingResult.from_dict(ref_result_dict)
+                if ref_result.status == "completed":
+                    _store_reference_runtime(
+                        eval_task.uuid,
+                        eval_task.reference_code,
+                        eval_task.is_valid,
+                        ref_result.reference_runtime,
+                    )
 
         if ref_result is None:
             result = self._kernel_only_result(eval_task, kernel_result)

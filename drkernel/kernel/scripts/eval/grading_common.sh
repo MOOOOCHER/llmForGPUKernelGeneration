@@ -390,6 +390,7 @@ run_grading() {
   fi
 
   PYTHONUNBUFFERED=1 python -m kernel.main_grading \
+      ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS:-8} \
       data.path=$EVAL_DATASET \
       data.output_path=$OUTPUT_PATH \
       $raw_response_arg \
