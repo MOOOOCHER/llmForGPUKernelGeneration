@@ -2,9 +2,31 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional, Tuple
 
 from kernelgym.common import ErrorCode
+
+
+NON_IEEE_FP32_PATTERNS = [
+    r"set_float32_matmul_precision\s*\(\s*['\"](?:high|medium)['\"]\s*\)",
+    r"(?:cuda\.matmul|cudnn)\.allow_tf32\s*=\s*True\b",
+    r"\binput_precision\s*=\s*['\"](?:tf32|tf32x3)['\"]",
+    r"\ballow_tf32\s*=\s*True\b",
+    r"TRITON_F32_DEFAULT['\"]?\s*\]?\s*=\s*['\"](?:tf32|tf32x3)['\"]",
+]
+
+
+def validate_strict_fp32_code(code: str) -> Tuple[bool, str]:
+    """Reject candidate code that explicitly opts into non-IEEE FP32 math."""
+    uncommented = "\n".join(line.split("#", 1)[0] for line in code.splitlines())
+    for pattern in NON_IEEE_FP32_PATTERNS:
+        if re.search(pattern, uncommented, flags=re.IGNORECASE):
+            return (
+                False,
+                "Non-IEEE FP32 math mode detected: TF32 or reduced FP32 is forbidden",
+            )
+    return True, ""
 
 
 def validate_code(code: str, entry_point: str = "Model") -> Tuple[bool, str]:
@@ -14,6 +36,10 @@ def validate_code(code: str, entry_point: str = "Model") -> Tuple[bool, str]:
             return False, "Code is required"
         if f"class {entry_point}" not in code:
             return False, f"Code must contain a '{entry_point}' class"
+        if entry_point.endswith("New"):
+            fp32_valid, fp32_error = validate_strict_fp32_code(code)
+            if not fp32_valid:
+                return False, fp32_error
         return True, ""
     except Exception as exc:
         return False, f"Code validation error: {exc}"

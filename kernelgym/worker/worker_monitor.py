@@ -410,6 +410,7 @@ except Exception as e:
             import subprocess
             import functools
             
+            process_env = {**os.environ}
             # Build command to start single worker
             cmd = [
                 sys.executable,
@@ -418,6 +419,45 @@ except Exception as e:
                 "--device", device,
                 "--persistent"
             ]
+            worker_container = os.environ.get("KERNELGYM_WORKER_CONTAINER", "")
+            if worker_container:
+                repo_root = os.environ.get("KERNELGYM_REPO_ROOT", str(Path.cwd()))
+                enroot_root = Path(
+                    os.environ.get(
+                        "KERNELGYM_ENROOT_ROOT",
+                        "/sc/scratch/zongxiong.chen/daniel/.enroot",
+                    )
+                )
+                job_id = os.environ.get("SLURM_JOB_ID", "manual")
+                worker_root = (
+                    enroot_root / "jobs" / f"kernelgym-{job_id}" / worker_id
+                )
+                for path in (
+                    enroot_root / "cache",
+                    worker_root / "data",
+                    worker_root / "runtime",
+                    worker_root / "tmp",
+                ):
+                    path.mkdir(parents=True, exist_ok=True)
+                process_env.update(
+                    {
+                        "ENROOT_CACHE_PATH": str(enroot_root / "cache"),
+                        "ENROOT_DATA_PATH": str(worker_root / "data"),
+                        "ENROOT_RUNTIME_PATH": str(worker_root / "runtime"),
+                        "ENROOT_TEMP_PATH": str(worker_root / "tmp"),
+                    }
+                )
+                pass_env = (
+                    "REDIS_HOST", "REDIS_PORT", "REDIS_KEY_PREFIX",
+                    "API_HOST", "API_PORT", "GPU_DEVICES", "NODE_ID",
+                    "KERNELGYM_TASK_ARCHIVE_DIR", "PYTHONPATH",
+                )
+                cmd = ["enroot", "start", "--root", "--mount", f"{repo_root}:{repo_root}"]
+                for name in pass_env:
+                    if name in process_env:
+                        cmd.extend(["--env", name])
+                cmd.extend([worker_container, "python", "-m", "kernelgym.worker.single_worker",
+                            "--worker-id", worker_id, "--device", device, "--persistent"])
             
             # Ensure logs directory exists and append logs to the same pattern as manual start
             logs_dir = Path("logs")
@@ -441,7 +481,7 @@ except Exception as e:
                 cmd,
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
-                env={**os.environ},
+                env=process_env,
                 preexec_fn=preexec_fn,
                 creationflags=creationflags
             )
