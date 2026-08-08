@@ -304,27 +304,21 @@ reward_model:
   task_timeout_in_client: 2400
   print_status: true
 
-  init_correct_weight: 0.5
-  init_performance_weight: 0.5
+  init_correct_weight: 1.0
+  init_performance_weight: 1.0
   speedup_eps: 0.01
   speedup_reward_upper_bound: 3.0
   speedup_reward_lower_bound: 0.0
   coverage_reward:
     reward_type: "time_coverage"
-    enable: false
-    weight: 0.25
+    enable: true
+    weight: 0.5
   fusion_reward:
-    # Reference-boundary launch assignment via DefragmentationFramework; used by fusion reward functions
+    # Dataset-targeted, execution-group compression reward for correct kernels.
     enable: false
     detector: "profiled_export"
-    resolved_weight: 0.25        # reference operator boundaries proven to share one custom launch
-    unresolved_weight: -0.1     # missing, ambiguous, split-launch, or unparsable boundaries are penalized
-    anchor_bonus_weight: 0.08    # per proven boundary adjacent to anchor_semantics: weight * min(count, anchor_bonus_cap)
-    anchor_bonus_cap: 4         # cap on the number of anchored resolved plans counted for the bonus
-    anchor_semantics: ["conv*", "linear"]  # "foo*" matches by prefix: conv* covers conv1d/2d/3d, conv_transpose*, ...
+    weight: 0.5                 # multiplied by normalized compression gain and clipped speedup factor
     defrag_framework_path: null # defaults to the DefragmentationFramework checkout next to KernelGYM
-    print_plans: true           # print plans and proven/not-proven fusion boundaries per sample for debugging
-    # note: coverage also applies to calculate_reward_fusion via the coverage_reward block above (enable + weight)
 
   # Performance evaluation
   num_perf_trials: 100

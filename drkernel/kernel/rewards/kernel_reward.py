@@ -141,6 +141,7 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
         if hasattr(reward_config, "reward_model"):
             reward_config = reward_config.reward_model
         uuids = kwargs.get("uuids", None)
+        sample_extra_infos = kwargs.get("sample_extra_infos", None)
         is_valid = kwargs.get("is_valid", False)
 
         try:
@@ -185,6 +186,11 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
                 "verbose_errors": verbose_errors,
                 "detect_decoy_kernel": detect_decoy_kernel,
                 "reference_backend": reference_backend,
+                "sample_extra_info": (
+                    sample_extra_infos[i]
+                    if sample_extra_infos is not None and i < len(sample_extra_infos)
+                    else {}
+                ),
             })
         
         # 同步调用异步函数

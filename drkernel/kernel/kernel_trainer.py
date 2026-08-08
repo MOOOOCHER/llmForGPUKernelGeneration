@@ -2197,6 +2197,10 @@ class RayKernelTrainer(RayPPOTrainer):
                 test_gen_batch.non_tensor_batch[
                     "data_source"
                 ] = test_batch.non_tensor_batch["data_source"]
+                if "extra_info" in test_batch.non_tensor_batch:
+                    test_gen_batch.non_tensor_batch[
+                        "extra_info"
+                    ] = test_batch.non_tensor_batch["extra_info"]
 
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(
                 test_gen_batch, self.actor_rollout_wg.world_size
@@ -2854,6 +2858,10 @@ class RayKernelTrainer(RayPPOTrainer):
                     gen_batch.non_tensor_batch["data_source"] = batch.non_tensor_batch[
                         "data_source"
                     ]
+                    if "extra_info" in batch.non_tensor_batch:
+                        gen_batch.non_tensor_batch[
+                            "extra_info"
+                        ] = batch.non_tensor_batch["extra_info"]
 
                 with _timer("step", timing_raw):
                     # generate a batch

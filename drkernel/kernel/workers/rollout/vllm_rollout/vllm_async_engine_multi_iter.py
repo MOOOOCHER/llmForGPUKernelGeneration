@@ -1159,21 +1159,15 @@ class MultiIterAsyncvLLMEngine:
         """Load turn selection rules for the multi-turn agent loop."""
         per_turn_prompts = {}
         self.fusion_first_turn_prompt = None
-        # The fusion guidance prompt is only used when the fusion reward is selected.
-        reward_func_name = str(
-            self.config.rollout.multi_turn.get("reward_func_name", "") or ""
-        )
+        # Structured datasets already contain their fusion-plan guidance. Keep
+        # runtime plan generation behind an explicit legacy opt-in only.
         fusion_prompt_enabled = os.environ.get("FUSION_PROMPT_ENABLED", "").lower() in {
             "1",
             "true",
             "yes",
             "on",
         }
-        self.fusion_reward_active = fusion_prompt_enabled or reward_func_name in {
-            "calculate_reward_fusion",
-            "calculate_reward_speedup_fusion",
-            "calculate_reward_compile_correct_speedup_coverage_fusion",
-        }
+        self.fusion_reward_active = fusion_prompt_enabled
 
         # Get prompt config path from config, with fallback to default
         prompt_config_path = self.config.rollout.multi_turn.get("prompt_config_path", None)
@@ -1983,7 +1977,10 @@ class MultiIterAsyncvLLMEngine:
         #     [data_source],
         #     [extra_info],
         # )
-        reward_kwargs = {"response_length": max_tokens}
+        reward_kwargs = {
+            "response_length": max_tokens,
+            "sample_extra_info": (req.extra_info or {}).get("extra_info", {}),
+        }
 
         # Use run_in_executor to run sync reward_fn in async context
         loop = asyncio.get_running_loop()

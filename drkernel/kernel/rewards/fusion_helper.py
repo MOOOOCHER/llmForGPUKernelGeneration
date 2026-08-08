@@ -41,7 +41,7 @@ _DEFAULT_REFERENCE_CACHE_ROOT = (
     / "RL-Training"
     / "reference_fusion_cache"
 )
-_REFERENCE_CONTEXT_VERSION = "reference-export-v3"
+_REFERENCE_CONTEXT_VERSION = "reference-export-v5-scoped-library-anchors"
 
 # Plan actions whose first/last semantic is a producer anchor.
 _ANCHOR_FIRST_ACTIONS = {"fuse_epilogue", "fuse_pointwise_diamond"}
@@ -49,7 +49,9 @@ _ANCHOR_LAST_ACTIONS = {"fuse_prologue"}
 
 # Entries ending with "*" match by prefix: "conv*" covers conv1d/2d/3d,
 # conv_transpose*, convolution, ... as emitted by the semantic lift.
-DEFAULT_ANCHOR_SEMANTICS = ("conv*", "linear")
+# Optimized-library convolution and linear calls are not custom-fusion targets,
+# so they receive no additional anchor bonus by default.
+DEFAULT_ANCHOR_SEMANTICS: Tuple[str, ...] = ()
 
 _NAME_TOKEN_ALIASES = {
     "addmm": "linear",
@@ -122,22 +124,35 @@ def analyze_fusion_source(
     source_code: str,
     defrag_framework_path: Optional[str] = None,
     parse_mode: str = "defrag",
+    include_library_anchors: bool = False,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Return the lifted graph and its remaining fusion opportunities."""
     mods = _load_defrag_modules(defrag_framework_path)
     graph = mods["parse_program"](source_code, mode=parse_mode).to_dict()
     lifted = mods["lift_graph"](graph)
     fragments = mods["analyze_fragments"](lifted)
-    plans = mods["plan_defragmentation"](fragments, lifted, fusion_only=True)
+    plans = mods["plan_defragmentation"](
+        fragments,
+        lifted,
+        fusion_only=True,
+        include_library_anchors=include_library_anchors,
+    )
     return lifted, list(plans.get("plans", []))
 
 
 def _plans_from_lifted_graph(
-    lifted: Dict[str, Any], defrag_framework_path: Optional[str] = None
+    lifted: Dict[str, Any],
+    defrag_framework_path: Optional[str] = None,
+    include_library_anchors: bool = False,
 ) -> List[Dict[str, Any]]:
     mods = _load_defrag_modules(defrag_framework_path)
     fragments = mods["analyze_fragments"](lifted)
-    plans = mods["plan_defragmentation"](fragments, lifted, fusion_only=True)
+    plans = mods["plan_defragmentation"](
+        fragments,
+        lifted,
+        fusion_only=True,
+        include_library_anchors=include_library_anchors,
+    )
     return list(plans.get("plans", []))
 
 
@@ -163,13 +178,20 @@ def _reference_context_cache_root() -> Path:
     return Path(configured) if configured else _DEFAULT_REFERENCE_CACHE_ROOT
 
 
-def _reference_context_key(reference_code: str) -> str:
-    payload = f"{_REFERENCE_CONTEXT_VERSION}\0{reference_code}".encode()
+def _reference_context_key(
+    reference_code: str, include_library_anchors: bool
+) -> str:
+    payload = (
+        f"{_REFERENCE_CONTEXT_VERSION}\0{include_library_anchors}"
+        f"\0{reference_code}"
+    ).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
 def _build_reference_fusion_context(
-    reference_code: str, defrag_framework_path: Optional[str]
+    reference_code: str,
+    defrag_framework_path: Optional[str],
+    include_library_anchors: bool,
 ) -> Dict[str, Any]:
     source_hash = hashlib.sha256(reference_code.encode()).hexdigest()
     analysis_mode = "export"
@@ -187,16 +209,23 @@ def _build_reference_fusion_context(
                 return_metadata=True,
             )
         lifted = mods["lift_graph"](program.to_dict())
-        plans = _plans_from_lifted_graph(lifted, defrag_framework_path)
+        plans = _plans_from_lifted_graph(
+            lifted,
+            defrag_framework_path,
+            include_library_anchors=include_library_anchors,
+        )
         analysis_mode = str(export_metadata.get("mode", "export"))
     except Exception as exc:  # noqa: BLE001
         export_error = f"{type(exc).__name__}: {exc}"[:2000]
         lifted, plans = analyze_fusion_source(
-            reference_code, defrag_framework_path
+            reference_code,
+            defrag_framework_path,
+            include_library_anchors=include_library_anchors,
         )
         analysis_mode = "ast_fallback"
     return {
         "version": _REFERENCE_CONTEXT_VERSION,
+        "include_library_anchors": include_library_anchors,
         "source_hash": source_hash,
         "analysis_mode": analysis_mode,
         "export_error": export_error,
@@ -210,12 +239,16 @@ def _build_reference_fusion_context(
 
 @lru_cache(maxsize=512)
 def reference_fusion_context(
-    reference_code: str, defrag_framework_path: Optional[str] = None
+    reference_code: str,
+    defrag_framework_path: Optional[str] = None,
+    include_library_anchors: bool = False,
 ) -> Dict[str, Any]:
     """Return one shared, versioned reference graph and plan bundle."""
     reference_code = reference_code or ""
     cache_root = _reference_context_cache_root()
-    cache_key = _reference_context_key(reference_code)
+    cache_key = _reference_context_key(
+        reference_code, include_library_anchors
+    )
     cache_path = cache_root / f"{cache_key}.json"
     lock_path = cache_root / f"{cache_key}.lock"
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -225,12 +258,18 @@ def reference_fusion_context(
             if cache_path.is_file():
                 try:
                     cached = json.loads(cache_path.read_text())
-                    if cached.get("version") == _REFERENCE_CONTEXT_VERSION:
+                    if (
+                        cached.get("version") == _REFERENCE_CONTEXT_VERSION
+                        and cached.get("include_library_anchors")
+                        is include_library_anchors
+                    ):
                         return cached
                 except Exception:  # noqa: BLE001
                     pass
             context = _build_reference_fusion_context(
-                reference_code, defrag_framework_path
+                reference_code,
+                defrag_framework_path,
+                include_library_anchors,
             )
             temporary_path = cache_path.with_suffix(
                 f".{os.getpid()}.tmp"
@@ -721,6 +760,7 @@ class FusionDetectionContext:
     kernel_code: str
     correctness: bool = False
     profiler_metadata: Dict[str, Any] = field(default_factory=dict)
+    sample_extra_info: Dict[str, Any] = field(default_factory=dict)
     defrag_framework_path: Optional[str] = None
     max_graph_nodes: int = 2048
 
@@ -1276,6 +1316,7 @@ def _classify_profiled_boundaries(
             generated_graph, semantics
         )
         alignments: List[Tuple[str, ...]] = []
+        execution_group_counts: List[int] = []
         alignment_truncated = context_truncated
         confirmed: set[str] = set()
         for alignment_semantics, plan_positions in contexts:
@@ -1339,10 +1380,23 @@ def _classify_profiled_boundaries(
                             for index, node_id in context_visible_assignments.items()
                         )
                     ]
-                alignments.extend(
-                    tuple(assignment[index] for index in plan_positions)
-                    for assignment in path_alignments
-                )
+                for assignment in path_alignments:
+                    plan_assignment = tuple(
+                        assignment[index] for index in plan_positions
+                    )
+                    alignments.append(plan_assignment)
+                    # A lifted Python/Torch op and a Triton/CUDA call each have
+                    # one node id. Repeated ids mean one execution group covers
+                    # multiple reference semantics; consecutive kernel calls
+                    # retain distinct ids and therefore count separately.
+                    first_position = min(plan_positions)
+                    last_position = max(plan_positions)
+                    region_group_ids = {
+                        assignment[index]
+                        for index in range(first_position, last_position + 1)
+                        if assignment[index]
+                    }
+                    execution_group_counts.append(len(region_group_ids))
                 alignment_truncated = alignment_truncated or truncated
 
         unique_alignments = sorted(set(alignments))
@@ -1353,6 +1407,7 @@ def _classify_profiled_boundaries(
             "semantics": semantics,
             "assignments": [list(item) for item in unique_alignments[:64]],
             "assignment_count": len(unique_alignments),
+            "execution_group_counts": sorted(set(execution_group_counts)),
             "analysis_truncated": alignment_truncated or len(unique_alignments) > 64,
         }
         plan_alignments.append(plan_record)
@@ -1513,23 +1568,22 @@ class ProfiledExportFusionDetector:
 
     def detect(self, context: FusionDetectionContext) -> FusionDetectionResult:
         result = FusionDetectionResult(detector=self.name)
+        dataset_plan, skip_reason = _dataset_fusion_plan(context.sample_extra_info)
+        if dataset_plan is None:
+            result.skipped_reason = skip_reason
+            return result
+        result.reference_plans = [dataset_plan]
         try:
-            reference_context = reference_fusion_context(
-                context.reference_code, context.defrag_framework_path
+            reference_graph, export_metadata = _export_reference_lifted_graph(context)
+            result.reference_graph = _compact_lifted_graph(
+                reference_graph, context.max_graph_nodes
             )
-            result.reference_plans = list(
-                reference_context.get("fusion_plans", [])
-            )
-            result.reference_graph = reference_context.get("lifted_graph")
-            result.reference_analysis_mode = reference_context.get(
-                "analysis_mode"
-            )
-            result.reference_export_error = reference_context.get(
-                "export_error"
-            )
+            result.reference_analysis_mode = str(export_metadata.get("mode", "export"))
+            warning = export_metadata.get("warning")
+            result.reference_export_error = str(warning)[:2000] if warning else None
         except Exception as exc:  # noqa: BLE001
             result.error = (
-                f"reference plan generation failed: {type(exc).__name__}: {exc}"
+                f"reference graph export failed: {type(exc).__name__}: {exc}"
             )
             return result
         try:
@@ -1579,68 +1633,118 @@ class ProfiledExportFusionDetector:
         return result
 
 
+def _dataset_fusion_plan(
+    sample_extra_info: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Build one compression target covering the complete reference program.
+
+    Structured generation controls prompt construction only. Compression is
+    measured across every reference operator for both structured and random
+    samples, so neither ``is_structured`` nor ``fusion_chain`` limits reward
+    eligibility or scope.
+    """
+    info = sample_extra_info if isinstance(sample_extra_info, dict) else {}
+    operators = info.get("operators")
+    if not isinstance(operators, (list, tuple)):
+        return None, "missing_operator_chain"
+    semantics = [
+        str(item) for item in operators if item is not None and str(item)
+    ]
+    if len(semantics) < 2:
+        return None, "operator_chain_too_short"
+
+    program_graph = info.get("program_graph")
+    graph_nodes = (
+        program_graph.get("nodes", [])
+        if isinstance(program_graph, dict)
+        else []
+    )
+    node_ids = [
+        str(node.get("node_id"))
+        for node in graph_nodes
+        if isinstance(node, dict) and node.get("node_id") is not None
+    ]
+    if len(node_ids) != len(semantics):
+        node_ids = []
+
+    return {
+        "plan_id": "dataset_full_program",
+        "action": "fuse",
+        "semantics": semantics,
+        "node_ids": node_ids,
+        "target_nodes": node_ids,
+    }, None
+
+
+def _export_reference_lifted_graph(
+    context: FusionDetectionContext,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Export/lift the reference graph without generating a fusion plan."""
+    mods = _load_defrag_modules(context.defrag_framework_path)
+    with tempfile.TemporaryDirectory(prefix="fusion_reference_export_") as temp_dir:
+        reference_path = Path(temp_dir) / "reference.py"
+        reference_path.write_text(context.reference_code)
+        try:
+            program, metadata = mods["export_file"](
+                reference_path,
+                model_class="Model",
+                use_meta=True,
+                strict=False,
+                return_metadata=True,
+            )
+            graph = mods["lift_graph"](program.to_dict())
+        except Exception as export_exc:  # noqa: BLE001
+            try:
+                program = mods["parse_program"](context.reference_code, mode="defrag")
+                graph = mods["lift_graph"](program.to_dict())
+            except Exception as ast_exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "reference export and AST fallback failed: "
+                    f"{type(export_exc).__name__}: {export_exc}; "
+                    f"{type(ast_exc).__name__}: {ast_exc}"
+                ) from ast_exc
+            metadata = {
+                "mode": "ast_fallback",
+                "warning": f"{type(export_exc).__name__}: {export_exc}",
+            }
+    _compact_lifted_graph(graph, context.max_graph_nodes)
+    return graph, metadata
+
+
 def compute_fusion_reward(
     reference_code: str,
     kernel_code: str,
     *,
-    resolved_weight: float = 0.2,
-    unresolved_weight: float = -0.1,
-    anchor_bonus_weight: float = 0.08,
-    anchor_bonus_cap: int = 4,
-    anchor_semantics: Sequence[str] = DEFAULT_ANCHOR_SEMANTICS,
+    fusion_weight: float = 0.5,
+    speedup: float = 0.0,
     defrag_framework_path: Optional[str] = None,
     correctness: bool = False,
     profiler_metadata: Optional[Dict[str, Any]] = None,
+    sample_extra_info: Optional[Dict[str, Any]] = None,
     detector: str = "profiled_export",
 ) -> Dict[str, Any]:
-    """Compute the fusion reward component for one sample.
+    """Compute the correctness-gated, speedup-weighted fusion reward.
 
-    Never raises. Reference-analysis failures are neutral because there is no
-    valid fusion target. Generated-analysis failures classify every reference
-    boundary as unknown, which earns neither a fusion bonus nor a penalty.
+    For a dataset fusion chain with N reference operators and G generated
+    execution groups, gain=(N-G)/(N-1). Each aligned Python/Torch operation or
+    Triton/CUDA call is one group. Thus no compression is 0 and complete fusion
+    is exactly 1, independent of chain length.
     """
     zero = {
         "fusion_reward": 0.0,
-        "fusion_reference_plan_count": 0,
-        "fusion_reference_raw_plan_count": 0,
-        "fusion_reference_boundary_count": 0,
-        "fusion_generated_plan_count": 0,
-        "fusion_proven_fused_anchor_count": 0,
-        "fusion_anchor_bonus": 0.0,
-        "fusion_reference_plans": [],
-        "fusion_generated_plans": [],
-        "fusion_proven_fused_ratio": 0.0,
-        "fusion_not_proven_fused_ratio": 0.0,
-        "fusion_proven_fused_count": 0,
-        "fusion_not_proven_fused_count": 0,
-        "fusion_not_fused_count": 0,
-        "fusion_unknown_count": 0,
-        "fusion_proven_fused_boundaries": [],
-        "fusion_not_proven_fused_boundaries": [],
-        "fusion_not_fused_boundaries": [],
-        "fusion_unknown_boundaries": [],
-        "fusion_analysis_truncated": False,
+        "compression_reference_ops": 0,
+        "compression_execution_groups": None,
+        "compression_ratio": None,
+        "compression_gain": 0.0,
+        "compression_speed_factor": 0.0,
         "fusion_error": None,
-        "fusion_skipped_reason": None,
+        "compression_skipped_reason": None,
         "fusion_detector": detector,
-        "fusion_plan_artifact": {
-            "detector": detector,
-            "reference_fusion_plans": [],
-            "inferred_generated_fusion_plans": [],
-            "reference_graph": None,
-            "generated_graph": None,
-            "profiler_launches": [],
-            "plan_alignments": [],
-            "boundaries": [],
-            "analysis_truncated": False,
-            "error": None,
-            "skipped_reason": None,
-        },
+        "fusion_plan_artifact": None,
     }
 
-    if detector == "profiled_export" and not correctness:
-        zero["fusion_skipped_reason"] = "incorrect_kernel"
-        zero["fusion_plan_artifact"]["skipped_reason"] = "incorrect_kernel"
+    if not correctness:
+        zero["compression_skipped_reason"] = "incorrect_kernel"
         return zero
 
     context = FusionDetectionContext(
@@ -1648,105 +1752,59 @@ def compute_fusion_reward(
         kernel_code=kernel_code or "",
         correctness=correctness,
         profiler_metadata=profiler_metadata or {},
+        sample_extra_info=sample_extra_info or {},
         defrag_framework_path=defrag_framework_path,
     )
-    selected_detector = (
-        AstFusionDetector() if detector == "ast" else ProfiledExportFusionDetector()
-    )
+    selected_detector = ProfiledExportFusionDetector()
     detection = selected_detector.detect(context)
-    reference_plans = detection.reference_plans
-    generated_plans = detection.generated_plans
-    boundaries = detection.boundaries
     zero["fusion_plan_artifact"] = detection.artifact()
-    zero["fusion_reference_plans"] = [
-        format_fusion_plan(plan) for plan in reference_plans
-    ]
-    zero["fusion_reference_raw_plan_count"] = len(reference_plans)
-    zero["fusion_generated_plans"] = [
-        (
-            format_fusion_plan(plan)
-            if plan.get("action")
-            else (
-                f"launch[{plan.get('launch_id', '?')}:"
-                f"{'+'.join(plan.get('semantics', [])) or '?'}]"
-            )
-        )
-        for plan in generated_plans
-    ]
-    zero["fusion_generated_plan_count"] = len(generated_plans)
     zero["fusion_error"] = detection.error
-
-    total_reference = len(boundaries)
-    zero["fusion_reference_plan_count"] = total_reference
-    zero["fusion_reference_boundary_count"] = total_reference
-    if total_reference == 0:
-        if zero["fusion_error"] is None:
-            zero["fusion_error"] = "no_reference_fusion_plans"
-            zero["fusion_plan_artifact"]["error"] = zero["fusion_error"]
+    plan = detection.reference_plans[0] if detection.reference_plans else None
+    reference_ops = len(plan.get("semantics", [])) if plan else 0
+    zero["compression_reference_ops"] = reference_ops
+    if detection.skipped_reason:
+        zero["compression_skipped_reason"] = detection.skipped_reason
+        return zero
+    if detection.error:
+        zero["compression_skipped_reason"] = "graph_export_failed"
         return zero
 
-    proven = [boundary for boundary in boundaries if boundary["proven_fused"]]
-    not_proven = [boundary for boundary in boundaries if not boundary["proven_fused"]]
-    not_fused = [boundary for boundary in boundaries if boundary["status"] == "not_fused"]
-    unknown = [boundary for boundary in boundaries if boundary["status"] == "unknown"]
+    group_counts = [
+        int(group_count)
+        for alignment in detection.plan_alignments
+        for group_count in alignment.get("execution_group_counts", [])
+        if int(group_count) > 0
+    ]
+    if not group_counts:
+        zero["compression_skipped_reason"] = "no_execution_group_alignment"
+        return zero
 
-    proven_ratio = len(proven) / total_reference
-    not_proven_ratio = len(not_proven) / total_reference
-
-    anchor_patterns = [str(s) for s in (anchor_semantics or DEFAULT_ANCHOR_SEMANTICS)]
-    proven_anchor_count = sum(
-        1
-        for boundary in proven
-        if anchor_semantic_matches(boundary.get("anchor_semantic"), anchor_patterns)
+    # Alignment ambiguity does not prevent measurement. If alternative valid
+    # alignments span different group counts, use the conservative larger count
+    # so ambiguity cannot inflate the fusion reward.
+    execution_groups = max(group_counts)
+    compression_ratio = execution_groups / reference_ops
+    compression_gain = (reference_ops - execution_groups) / (reference_ops - 1)
+    speed_factor = max(0.0, min((float(speedup) - 1.0) / 2.0, 1.0))
+    fusion_reward = float(fusion_weight) * compression_gain * speed_factor
+    zero.update(
+        {
+            "fusion_reward": fusion_reward,
+            "compression_execution_groups": execution_groups,
+            "compression_ratio": compression_ratio,
+            "compression_gain": compression_gain,
+            "compression_speed_factor": speed_factor,
+            "compression_skipped_reason": None,
+            "fusion_detector": detection.detector,
+        }
     )
-    anchor_bonus = anchor_bonus_weight * min(proven_anchor_count, anchor_bonus_cap)
-
-    fusion_reward = (
-        resolved_weight * proven_ratio
-        + unresolved_weight * (len(not_fused) / total_reference)
-        + anchor_bonus
-    )
-
-    proven_text = [format_fusion_boundary(boundary) for boundary in proven]
-    not_proven_text = [format_fusion_boundary(boundary) for boundary in not_proven]
-    not_fused_text = [format_fusion_boundary(boundary) for boundary in not_fused]
-    unknown_text = [format_fusion_boundary(boundary) for boundary in unknown]
-
-    return {
+    zero["fusion_plan_artifact"]["reward"] = {
         "fusion_reward": fusion_reward,
-        "fusion_reference_plan_count": total_reference,
-        "fusion_reference_raw_plan_count": len(reference_plans),
-        "fusion_reference_boundary_count": total_reference,
-        "fusion_generated_plan_count": len(generated_plans),
-        "fusion_proven_fused_anchor_count": proven_anchor_count,
-        "fusion_anchor_bonus": anchor_bonus,
-        "fusion_reference_plans": [format_fusion_plan(p) for p in reference_plans],
-        "fusion_generated_plans": [format_fusion_plan(p) for p in generated_plans],
-        "fusion_proven_fused_ratio": proven_ratio,
-        "fusion_not_proven_fused_ratio": not_proven_ratio,
-        "fusion_proven_fused_count": len(proven),
-        "fusion_not_proven_fused_count": len(not_proven),
-        "fusion_not_fused_count": len(not_fused),
-        "fusion_unknown_count": len(unknown),
-        "fusion_proven_fused_boundaries": proven_text,
-        "fusion_not_proven_fused_boundaries": not_proven_text,
-        "fusion_not_fused_boundaries": not_fused_text,
-        "fusion_unknown_boundaries": unknown_text,
-        "fusion_analysis_truncated": detection.analysis_truncated,
-        "fusion_error": detection.error,
-        "fusion_skipped_reason": detection.skipped_reason,
-        "fusion_detector": detection.detector,
-        "fusion_plan_artifact": {
-            **detection.artifact(),
-            "reward": {
-                "fusion_reward": fusion_reward,
-                "resolved_weight": resolved_weight,
-                "unresolved_weight": unresolved_weight,
-                "anchor_bonus_weight": anchor_bonus_weight,
-                "anchor_bonus": anchor_bonus,
-                "proven_fused_count": len(proven),
-                "not_fused_count": len(not_fused),
-                "unknown_count": len(unknown),
-            },
-        },
+        "fusion_weight": float(fusion_weight),
+        "compression_reference_ops": reference_ops,
+        "compression_execution_groups": execution_groups,
+        "compression_ratio": compression_ratio,
+        "compression_gain": compression_gain,
+        "compression_speed_factor": speed_factor,
     }
+    return zero
