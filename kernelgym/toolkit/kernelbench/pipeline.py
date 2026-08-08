@@ -157,6 +157,8 @@ def _run_performance_step(
                 enable_profiling=enable_profiling,
             )
             runtime_stats = get_timing_stats(elapsed_times, device=device)
+            metadata["kernel_runtime_stats"] = runtime_stats
+            metadata["runtime_anchor"] = "median"
 
             if enable_profiling and _profiling_empty(profiling_metrics):
                 retry_count = max(0, int(getattr(settings, "profiling_retry_count", 0)))
@@ -323,7 +325,7 @@ def _run_performance_step(
                     )
             if verbose:
                 print(f"[Eval] Performance Stats: {runtime_stats}")
-            kernel_exec_result.runtime = runtime_stats["mean"]
+            kernel_exec_result.runtime = runtime_stats["median"]
             kernel_exec_result.runtime_stats = runtime_stats
     except Exception as e:
         if verbose:
@@ -361,7 +363,6 @@ def eval_kernel_against_ref(
     metadata: Dict[str, Any] = {}
     metadata["hardware"] = torch.cuda.get_device_name(device=device)
     metadata["device"] = str(device)
-
     if is_triton:
         if isinstance(device, int):
             device_num = device
@@ -582,7 +583,6 @@ def eval_reference_only(
     metadata: Dict[str, Any] = {}
     metadata["hardware"] = torch.cuda.get_device_name(device=device)
     metadata["device"] = str(device)
-
     context: Dict[str, Any] = {}
 
     if verbose:
@@ -656,10 +656,12 @@ def eval_reference_only(
             enable_profiling=False,
         )
         runtime_stats = get_timing_stats(elapsed_times, device=device)
+        metadata["reference_runtime_stats"] = runtime_stats
+        metadata["runtime_anchor"] = "median"
 
         if verbose:
             print(f"[Eval] Performance Stats: {runtime_stats}")
-        kernel_exec_result.runtime = runtime_stats["mean"]
+        kernel_exec_result.runtime = runtime_stats["median"]
         kernel_exec_result.runtime_stats = runtime_stats
     except Exception as e:
         if verbose:

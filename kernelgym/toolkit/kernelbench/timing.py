@@ -11,6 +11,18 @@ from kernelgym.toolkit.kernelbench.profiling import (
     extract_profiling_metrics,
     profiling_context,
 )
+def clear_l2_cache(device: torch.device | int | str = "cuda") -> None:
+    """Thrash the GPU L2 cache to match KernelBench's cold-cache protocol."""
+    # Keep this byte-for-byte equivalent in size and behavior to
+    # KernelBench/src/kernelbench/timing.py::clear_l2_cache:
+    # 32 * 1024 * 1024 int64 values = 256 MiB, larger than H100's L2.
+    dummy = torch.empty(
+        (32, 1024, 1024),
+        dtype=torch.int64,
+        device=device,
+    )
+    dummy.fill_(42)
+    del dummy
 
 
 def time_execution_with_cuda_event(
@@ -18,6 +30,7 @@ def time_execution_with_cuda_event(
     *args,
     num_warmup: int = 3,
     num_trials: int = 10,
+    discard_first: int = 1,
     verbose: bool = True,
     device: torch.device = None,
     enable_profiling: bool = False,
@@ -30,15 +43,19 @@ def time_execution_with_cuda_event(
     for _ in range(num_warmup):
         kernel_fn(*args)
         torch.cuda.synchronize(device=device)
+    torch.cuda.empty_cache()
 
     print(
         f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
     )
     elapsed_times = []
 
-    for trial in range(num_trials):
+    for trial in range(num_trials + discard_first):
+        torch.cuda.synchronize(device=device)
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
+
+        clear_l2_cache(device=device)
 
         start_event.record()
         kernel_fn(*args)
@@ -46,10 +63,12 @@ def time_execution_with_cuda_event(
 
         torch.cuda.synchronize(device=device)
 
-        elapsed_time_ms = start_event.elapsed_time(end_event)
-        if verbose:
-            print(f"Trial {trial + 1}: {elapsed_time_ms:.3g} ms")
-        elapsed_times.append(elapsed_time_ms)
+        if trial >= discard_first:
+            elapsed_time_ms = start_event.elapsed_time(end_event)
+            if verbose:
+                logical_idx = trial - discard_first + 1
+                print(f"Trial {logical_idx}: {elapsed_time_ms:.3g} ms")
+            elapsed_times.append(elapsed_time_ms)
 
     profiling_metrics: Dict[str, Any] = {}
     if enable_profiling:
@@ -117,10 +136,12 @@ def run_profiling_only(
 def get_timing_stats(elapsed_times: List[float], device: torch.device = None) -> dict:
     stats = {
         "mean": float(f"{np.mean(elapsed_times):.3g}"),
+        "median": float(f"{np.median(elapsed_times):.3g}"),
         "std": float(f"{np.std(elapsed_times):.3g}"),
         "min": float(f"{np.min(elapsed_times):.3g}"),
         "max": float(f"{np.max(elapsed_times):.3g}"),
         "num_trials": len(elapsed_times),
+        "runtime_anchor": "median",
     }
 
     if device:

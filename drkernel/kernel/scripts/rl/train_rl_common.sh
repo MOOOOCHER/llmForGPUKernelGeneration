@@ -123,7 +123,7 @@ ROLLOUT_RS_KWARGS=${ROLLOUT_RS_KWARGS:-"{lower:0.5,upper:2.0}"}
 # - SPEEDUP_THRESHOLD: Optional speedup threshold for OR logic (null to disable)
 #   If set, samples are kept if EITHER coverage OR speedup meets threshold
 #   Example: 1.5 means keep samples with >=1.5x speedup regardless of coverage
-COVERAGE_RS=${COVERAGE_RS:-null}
+COVERAGE_RS=${COVERAGE_RS:-"turn"}
 COVERAGE_RS_THRESHOLD=${COVERAGE_RS_THRESHOLD:-0.3}
 COVERAGE_RS_FACTOR=${COVERAGE_RS_FACTOR:-0.1}
 COVERAGE_RS_KEY=${COVERAGE_RS_KEY:-"time_coverage"}

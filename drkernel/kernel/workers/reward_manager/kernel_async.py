@@ -86,7 +86,7 @@ class AsyncKernelRewardManager:
         except Exception:
             pass
 
-    def execute_env(self, response_str: str, ground_truth: str, entry_point: str, uuid: str, response_ids: list[int]):
+    def execute_env(self, response_str: str, ground_truth: str, entry_point: str, uuid: str, response_ids: list[int], sample_extra_info=None):
         """
         Execute the environment and return the result
         We split it since we hope to re-evaluate when the speedup value is anomaly large.
@@ -136,6 +136,7 @@ class AsyncKernelRewardManager:
                     results = self.compute_score(
                         solution_strs, ground_truths, entry_points,
                         uuids=uuids,
+                        sample_extra_infos=[sample_extra_info or {}],
                         **safe_kwargs
                     )
                 else:
@@ -143,7 +144,12 @@ class AsyncKernelRewardManager:
                     results = []
                     for i, (solution_str, ground_truth, entry_point) in enumerate(zip(solution_strs, ground_truths, entry_points)):
                         uuid_val = uuids[i] if i < len(uuids) else None
-                        single_kwargs = {**safe_kwargs, "entry_point": entry_point, "uuid": uuid_val}
+                        single_kwargs = {
+                            **safe_kwargs,
+                            "entry_point": entry_point,
+                            "uuid": uuid_val,
+                            "sample_extra_info": sample_extra_info or {},
+                        }
                         result = self.compute_score(
                             solution_str=solution_str,
                             ground_truth=ground_truth,
@@ -242,7 +248,10 @@ class AsyncKernelRewardManager:
         
         # 使用计算函数进行评估
 
-        results = self.execute_env(response_str, ground_truth, entry_point, uuid, response_ids)
+        sample_extra_info = kwargs.get("sample_extra_info", {})
+        results = self.execute_env(
+            response_str, ground_truth, entry_point, uuid, response_ids, sample_extra_info
+        )
 
         speedup = results[0].get("speedup", 0.0)
 
@@ -251,7 +260,9 @@ class AsyncKernelRewardManager:
 
         if speedup > self.reward_config.speedup_reward_upper_bound:
             print(f"[DEBUG] speedup is anomaly large, re-execute the environment")
-            results = self.execute_env(response_str, ground_truth, entry_point, uuid, response_ids)
+            results = self.execute_env(
+                response_str, ground_truth, entry_point, uuid, response_ids, sample_extra_info
+            )
             speedup = results[0].get("speedup", 0.0)
 
         results = results[0]

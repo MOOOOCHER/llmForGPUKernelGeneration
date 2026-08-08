@@ -106,6 +106,12 @@ REDIS_KEY_PREFIX="${REDIS_KEY_PREFIX:-kernelgym}"
 
 PYTHONPATH="${ROOT_DIR}"
 export PYTHONPATH
+export KERNELGYM_REPO_ROOT="${ROOT_DIR}"
+KERNELGYM_WORKER_CONTAINER="${KERNELGYM_WORKER_CONTAINER:-}"
+KERNELGYM_ENROOT_ROOT="${KERNELGYM_ENROOT_ROOT:-/sc/scratch/zongxiong.chen/daniel/.enroot}"
+if [[ -n "${KERNELGYM_WORKER_CONTAINER}" && ! -f "${KERNELGYM_WORKER_CONTAINER}" ]]; then
+    echo "KernelGym worker container not found: ${KERNELGYM_WORKER_CONTAINER}"; exit 1
+fi
 
 port_is_open() {
     local host="$1"
@@ -187,11 +193,42 @@ echo "Starting GPU workers..."
 for gpu in ${GPU_LIST}; do
     WORKER_ID="worker_gpu_${gpu}"
     echo "Launching ${WORKER_ID} on cuda:${gpu}"
-    python -m kernelgym.worker.single_worker \
-        --worker-id "${WORKER_ID}" \
-        --device "cuda:${gpu}" \
-        --persistent \
-        > "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
+    if [[ -n "${KERNELGYM_WORKER_CONTAINER}" ]]; then
+        WORKER_ENROOT_ROOT="${KERNELGYM_ENROOT_ROOT}/jobs/kernelgym-${SLURM_JOB_ID:-manual}/${WORKER_ID}"
+        mkdir -p \
+            "${KERNELGYM_ENROOT_ROOT}/cache" \
+            "${WORKER_ENROOT_ROOT}/data" \
+            "${WORKER_ENROOT_ROOT}/runtime" \
+            "${WORKER_ENROOT_ROOT}/tmp"
+        env \
+            ENROOT_CACHE_PATH="${KERNELGYM_ENROOT_ROOT}/cache" \
+            ENROOT_DATA_PATH="${WORKER_ENROOT_ROOT}/data" \
+            ENROOT_RUNTIME_PATH="${WORKER_ENROOT_ROOT}/runtime" \
+            ENROOT_TEMP_PATH="${WORKER_ENROOT_ROOT}/tmp" \
+            enroot start \
+                --root \
+                --mount "${ROOT_DIR}:${ROOT_DIR}" \
+                --env REDIS_HOST \
+                --env REDIS_PORT \
+                --env REDIS_PASSWORD \
+                --env REDIS_KEY_PREFIX \
+                --env API_HOST \
+                --env API_PORT \
+                --env GPU_DEVICES \
+                --env NODE_ID \
+                --env KERNELGYM_TASK_ARCHIVE_DIR \
+                --env PYTHONPATH \
+                "${KERNELGYM_WORKER_CONTAINER}" \
+                python -m kernelgym.worker.single_worker \
+                    --worker-id "${WORKER_ID}" \
+                    --device "cuda:${gpu}" \
+                    --persistent \
+            > "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
+    else
+        python -m kernelgym.worker.single_worker \
+            --worker-id "${WORKER_ID}" --device "cuda:${gpu}" --persistent \
+            > "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
+    fi
     WORKER_PID=$!
     WORKER_PIDS+=("${WORKER_PID}")
     write_pid_file

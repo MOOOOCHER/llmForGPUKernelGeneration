@@ -294,7 +294,7 @@ class KernelSimpleToolkit(Toolkit):
                 )
                 runtime_stats = get_timing_stats(elapsed_times, device=device)
                 metadata["runtime_stats"] = runtime_stats
-                kernel_runtime = runtime_stats["mean"]
+                kernel_runtime = runtime_stats["median"]
                 if enable_profiling and profiling_metrics:
                     metadata["profiling"] = profiling_metrics
             else:
