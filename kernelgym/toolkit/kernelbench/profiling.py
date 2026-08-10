@@ -15,7 +15,11 @@ logger = logging.getLogger("kernelgym.toolkit.kernelbench.profiling")
 
 
 def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling_result: Dict[str, Any]):
-    """Compute the coverage of the matched triton kernels in the profiling result."""
+    """Compute generated-kernel coverage over total CUDA execution time.
+
+    PR is defined as T_generated / T_total, where both terms are CUDA times.
+    CPU profiler overhead must not be included in the denominator.
+    """
 
     def _matches_profiler_name(captured: str, profiler_name: str) -> bool:
         cap = captured.lower()
@@ -29,18 +33,21 @@ def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling
     kernels = matched_triton_kernels
     num_custom_kernels = 0
     kernel_names = [kernel.split(" ")[0] for kernel in kernels]
+    # Some Triton runtime hooks also report the Python callable type as the
+    # literal name "function". It is not a launched kernel and would otherwise
+    # falsely match profiler bookkeeping such as "Lazy Function Loading".
+    kernel_names = [name for name in kernel_names if name.lower() != "function"]
 
     kernels_in_profiling = profilling_result["kernels"]
 
-    total_time = 0.0
+    total_cuda_time = 0.0
     matched_cuda_time = 0.0
     triton_kernels_in_profiling = []
 
     for prof_kernel in kernels_in_profiling:
         prof_name = prof_kernel["name"]
         cuda_time = float(prof_kernel["cuda_time_us"])
-        cpu_time = float(prof_kernel["cpu_time_us"])
-        total_time += cuda_time + cpu_time
+        total_cuda_time += cuda_time
 
         if any(_matches_profiler_name(kernel_name, prof_name) for kernel_name in kernel_names):
             triton_kernels_in_profiling.append(prof_name)
@@ -56,7 +63,7 @@ def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling
     return {
         "num_custom_kernels": num_custom_kernels,
         "num_total_kernels": len(kernels_in_profiling),
-        "total_kernel_run_time_in_profiling_us": total_time,
+        "total_kernel_run_time_in_profiling_us": total_cuda_time,
         "custom_kernel_cuda_time_in_profiling_us": matched_cuda_time,
         "triton_kernels_not_in_profiling": triton_kernels_not_in_profiling,
         "triton_kernels_in_profiling": triton_kernels_in_profiling,
@@ -84,6 +91,16 @@ def profiling_context(enabled: bool = True):
             print("[Profiler] No activities configured, profiler will return no data")
             yield None
             return
+
+        # Validate CUDA before the profiler starts so this diagnostic does not
+        # pollute T_total with its fill and reduction kernels.
+        if torch.cuda.is_available():
+            try:
+                test = torch.ones((1024,), device="cuda")
+                _ = test.sum()
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"[Profiler] Self-test failed: {e}")
 
         prof = profiler.profile(
             activities=activities,
@@ -113,14 +130,6 @@ def profiling_context(enabled: bool = True):
                 device_info,
                 cuda_visible,
             )
-            if cuda_available:
-                try:
-                    test = torch.ones((1024,), device="cuda")
-                    _ = test.sum()
-                    torch.cuda.synchronize()
-                    print("[Profiler] Self-test CUDA op executed")
-                except Exception as e:
-                    print(f"[Profiler] Self-test failed: {e}")
             yield prof
         finally:
             try:
@@ -203,9 +212,11 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
             if cuda_time_us <= 0.0:
                 continue
             device_type = getattr(evt, "device_type", None)
+            # CPU-side operators report the CUDA time of their child launches.
+            # Keeping them would double-count those launches in T_total.
             if device_type is not None and device_type != profiler.DeviceType.CUDA:
-                pass
-            elif device_type == profiler.DeviceType.CUDA:
+                continue
+            if device_type == profiler.DeviceType.CUDA:
                 cuda_device_event_count += 1
             cuda_time_event_count += 1
 

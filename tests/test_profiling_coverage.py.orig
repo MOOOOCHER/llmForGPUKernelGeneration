@@ -1,0 +1,31 @@
+import pytest
+
+from kernelgym.toolkit.kernelbench.profiling import compute_triton_kernel_coverage
+
+
+def test_time_coverage_uses_cuda_time_for_both_numerator_and_denominator():
+    profiling_result = {
+        "kernels": [
+            {
+                "name": "generated_kernel",
+                "cpu_time_us": 100.0,
+                "cuda_time_us": 20.0,
+            },
+            {
+                "name": "aten::sum",
+                "cpu_time_us": 900.0,
+                "cuda_time_us": 30.0,
+            },
+        ]
+    }
+
+    coverage = compute_triton_kernel_coverage(
+        ["generated_kernel grid=(1,)"], profiling_result
+    )
+
+    assert coverage["custom_kernel_cuda_time_in_profiling_us"] == pytest.approx(20.0)
+    assert coverage["total_kernel_run_time_in_profiling_us"] == pytest.approx(50.0)
+    assert (
+        coverage["custom_kernel_cuda_time_in_profiling_us"]
+        / coverage["total_kernel_run_time_in_profiling_us"]
+    ) == pytest.approx(0.4)
