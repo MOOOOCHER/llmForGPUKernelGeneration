@@ -1645,6 +1645,17 @@ def _dataset_fusion_plan(
     """
     info = sample_extra_info if isinstance(sample_extra_info, dict) else {}
     operators = info.get("operators")
+    # Nested list fields loaded through pandas/pyarrow arrive as NumPy arrays.
+    # Normalize array-like containers before validating the operator chain so
+    # valid Parquet metadata is not mislabeled as missing.
+    if not isinstance(operators, (list, tuple)):
+        to_list = getattr(operators, "tolist", None)
+        if callable(to_list):
+            operators = to_list()
+        else:
+            to_pylist = getattr(operators, "to_pylist", None)
+            if callable(to_pylist):
+                operators = to_pylist()
     if not isinstance(operators, (list, tuple)):
         return None, "missing_operator_chain"
     semantics = [
@@ -1785,7 +1796,11 @@ def compute_fusion_reward(
     execution_groups = max(group_counts)
     compression_ratio = execution_groups / reference_ops
     compression_gain = (reference_ops - execution_groups) / (reference_ops - 1)
-    speed_factor = max(0.0, min((float(speedup) - 1.0) / 2.0, 1.0))
+    # Use the same positive, 3x-capped speedup scale as the base performance
+    # reward. Correct kernels below 1x still receive a compression-learning
+    # signal; faster kernels strengthen it without growing past the configured
+    # DrKernel speedup cap.
+    speed_factor = max(0.0, min(float(speedup), 3.0))
     fusion_reward = float(fusion_weight) * compression_gain * speed_factor
     zero.update(
         {
