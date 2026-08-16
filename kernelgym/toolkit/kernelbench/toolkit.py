@@ -137,17 +137,21 @@ class KernelBenchToolkit(Toolkit):
                     result.metadata = {}
                 result.metadata["correctness_skipped"] = True
 
-            reference_runtime = kernelbench_pipeline.eval_reference_only(
+            reference_result = kernelbench_pipeline.eval_reference_only(
                 original_model_src=task.reference_code,
                 num_perf_trials=task.num_perf_trials,
                 verbose=False,
                 device=device,
                 entry_point=task.entry_point,
+                enable_profiling=bool(enable_profiling),
                 backend_adapter=backend_adapter,
-            ).runtime
+            )
+            reference_runtime = reference_result.runtime
 
             if result.metadata is None:
                 result.metadata = {}
+            if reference_result.metadata:
+                result.metadata.update(reference_result.metadata)
             result.metadata.update(
                 {
                     "device": str(device),
@@ -210,6 +214,7 @@ class KernelBenchToolkit(Toolkit):
                 device=device,
                 entry_point=task.entry_point,
                 reference_backend=task.reference_backend,
+                enable_profiling=bool(task.enable_profiling),
                 backend_adapter=backend_adapter,
             )
             reference_runtime = ref_exec_result.runtime
@@ -222,12 +227,24 @@ class KernelBenchToolkit(Toolkit):
             }
             if ref_exec_result.metadata:
                 metadata.update(ref_exec_result.metadata)
+            reference_launch_count = None
+            try:
+                reference_launch_count = float(
+                    (ref_exec_result.metadata or {})["reference_profiling"]["kernel_launch_count"]
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
+            if reference_launch_count is not None:
+                # Keep a flat cache-compatible copy as well as the explicit
+                # result field used by the workflow RPC handoff.
+                metadata["reference_launch_count"] = reference_launch_count
 
             return ReferenceTimingResult(
                 task_id=task.task_id,
                 base_task_id=task.base_task_id,
                 reference_runtime=reference_runtime,
                 metadata=metadata,
+                reference_launch_count=reference_launch_count,
                 status="completed",
             )
 

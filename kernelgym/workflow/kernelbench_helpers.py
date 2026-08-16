@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections import OrderedDict
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from .kernelbench_types import (
     EvaluationTask,
@@ -29,7 +29,7 @@ class InMemoryReferenceCache:
     def __init__(self, max_entries: int = 100_000):
         self._max_entries = max_entries
         self._lock = threading.Lock()
-        self._entries: OrderedDict[Tuple[str, str, bool], float] = OrderedDict()
+        self._entries: OrderedDict[Tuple[str, str, bool], Dict[str, Any]] = OrderedDict()
 
     @staticmethod
     def _key(uuid: str, reference_code: str, is_valid: bool) -> Tuple[str, str, bool]:
@@ -41,17 +41,40 @@ class InMemoryReferenceCache:
             return None
         key = self._key(uuid, reference_code, is_valid)
         with self._lock:
-            runtime = self._entries.get(key)
-            if runtime is not None:
+            entry = self._entries.get(key)
+            if entry is not None:
                 self._entries.move_to_end(key)
-            return runtime
+            return float(entry["runtime"]) if entry is not None else None
 
-    def put(self, uuid: Optional[str], reference_code: str, is_valid: bool, runtime: float) -> None:
+    def get_metadata(
+        self, uuid: Optional[str], reference_code: str, is_valid: bool
+    ) -> Optional[Dict[str, Any]]:
+        if not uuid:
+            return None
+        key = self._key(uuid, reference_code, is_valid)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            self._entries.move_to_end(key)
+            return dict(entry.get("metadata") or {})
+
+    def put(
+        self,
+        uuid: Optional[str],
+        reference_code: str,
+        is_valid: bool,
+        runtime: float,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not uuid or runtime is None or runtime <= 0:
             return
         key = self._key(uuid, reference_code, is_valid)
         with self._lock:
-            self._entries[key] = float(runtime)
+            self._entries[key] = {
+                "runtime": float(runtime),
+                "metadata": dict(metadata or {}),
+            }
             self._entries.move_to_end(key)
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
@@ -74,12 +97,30 @@ def _get_cached_reference_runtime(
     return _reference_cache.get(uuid, reference_code, is_valid)
 
 
+def _get_cached_reference_metadata(
+    uuid: Optional[str], reference_code: str, is_valid: bool
+) -> Optional[Dict[str, Any]]:
+    if _reference_cache is None or not hasattr(_reference_cache, "get_metadata"):
+        return None
+    return _reference_cache.get_metadata(uuid, reference_code, is_valid)
+
+
 def _store_reference_runtime(
-    uuid: Optional[str], reference_code: str, is_valid: bool, runtime: float
+    uuid: Optional[str],
+    reference_code: str,
+    is_valid: bool,
+    runtime: float,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     if _reference_cache is None or not hasattr(_reference_cache, "put"):
         return
-    _reference_cache.put(uuid, reference_code, is_valid, runtime)
+    try:
+        _reference_cache.put(
+            uuid, reference_code, is_valid, runtime, metadata=metadata
+        )
+    except TypeError:
+        # Backward compatibility for an externally supplied runtime-only cache.
+        _reference_cache.put(uuid, reference_code, is_valid, runtime)
 
 
 def _validate_code(code: str, entry_point: str = "Model") -> Tuple[bool, str]:
@@ -119,6 +160,7 @@ def _create_paired_tasks(
                 entry_point=task.entry_point,
                 reference_backend=task.reference_backend,
                 device_preference=task.device_preference,
+                enable_profiling=task.enable_profiling,
                 resources=task.resources,
             )
     else:
@@ -136,6 +178,7 @@ def _create_paired_tasks(
             entry_point=task.entry_point,
             reference_backend=task.reference_backend,
             device_preference=task.device_preference,
+            enable_profiling=task.enable_profiling,
             resources=task.resources,
         )
 

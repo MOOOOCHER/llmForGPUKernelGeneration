@@ -14,6 +14,52 @@ from kernelgym.config import settings
 logger = logging.getLogger("kernelgym.toolkit.kernelbench.profiling")
 
 
+def _is_non_compute_cuda_activity(name: str) -> bool:
+    """Return whether a CUDA profiler activity is transport/runtime work.
+
+    CUDA memcpy and memset activities have positive device time but are not
+    compute-kernel launches or model execution groups.  Keeping them in the
+    launch denominator makes a fused implementation look artificially less
+    fused (for example, one Triton launch plus two DtoD copies as ``3``).
+    Real CUDA copy *kernels* such as ``direct_copy_kernel_cuda`` deliberately
+    do not match and remain part of the execution graph.
+    """
+    return name.lower().startswith(("memcpy", "memset"))
+
+
+def annotate_launch_count(
+    profiling_metrics: Dict[str, Any], num_profiling_trials: int
+) -> Dict[str, Any]:
+    """Add the CUDA launch count for one profiled forward pass.
+
+    ``key_averages()`` aggregates identical CUDA event names, so ``kernel_count``
+    is a count of distinct event types rather than launches. The event
+    ``count`` values retain the actual number of launches. Normalize their sum
+    by the number of forwards enclosed by the profiler context.
+    """
+    if not profiling_metrics:
+        return profiling_metrics
+    trials = int(num_profiling_trials)
+    profiling_metrics["profiling_num_trials"] = trials
+    if trials <= 0:
+        profiling_metrics["launch_count_warning"] = "invalid profiling trial count"
+        return profiling_metrics
+
+    kernels = profiling_metrics.get("kernels", [])
+    try:
+        total = sum(int(kernel.get("count", 0)) for kernel in kernels)
+    except (TypeError, ValueError, AttributeError):
+        profiling_metrics["launch_count_warning"] = "invalid profiler event count"
+        return profiling_metrics
+    profiling_metrics["kernel_launch_count_total"] = total
+    profiling_metrics["kernel_launch_count"] = total / trials
+    if kernels and total <= 0:
+        profiling_metrics["launch_count_warning"] = (
+            "profiler events have no launch counts"
+        )
+    return profiling_metrics
+
+
 def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling_result: Dict[str, Any]):
     """Compute generated-kernel coverage over total CUDA execution time.
 
@@ -190,6 +236,7 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
             return default
 
         cuda_kernels = []
+        excluded_cuda_activities = []
         total_cpu_time = 0.0
         total_self_cuda_time = 0.0
         for evt in events:
@@ -220,8 +267,9 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
                 cuda_device_event_count += 1
             cuda_time_event_count += 1
 
+            event_name = getattr(evt, "key", "unknown")
             kernel_entry = {
-                "name": getattr(evt, "key", "unknown"),
+                "name": event_name,
                 "cuda_time_us": cuda_time_us,
                 "cpu_time_us": cpu_time_us,
                 "count": _safe_int_metric(evt, ("count",), 0),
@@ -229,9 +277,13 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
             memory_usage = _safe_metric(evt, ("cuda_memory_usage",), 0.0)
             if memory_usage > 0.0:
                 kernel_entry["cuda_memory_usage"] = memory_usage
-            cuda_kernels.append(kernel_entry)
+            if _is_non_compute_cuda_activity(event_name):
+                excluded_cuda_activities.append(kernel_entry)
+            else:
+                cuda_kernels.append(kernel_entry)
 
         cuda_kernels.sort(key=lambda x: x["cuda_time_us"], reverse=True)
+        excluded_cuda_activities.sort(key=lambda x: x["cuda_time_us"], reverse=True)
 
         logger.debug(
             f"[Profiler] Filtered to {len(cuda_kernels)} CUDA kernels (from {len(events)} total)"
@@ -259,6 +311,14 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
             "kernel_count": len(cuda_kernels),
             "total_cpu_time_us": total_cpu_time,
             "total_cuda_time_us": sum(k["cuda_time_us"] for k in cuda_kernels),
+            "excluded_cuda_activities": excluded_cuda_activities,
+            "excluded_cuda_activity_count": len(excluded_cuda_activities),
+            "excluded_cuda_activity_launch_count": sum(
+                k["count"] for k in excluded_cuda_activities
+            ),
+            "excluded_cuda_activity_time_us": sum(
+                k["cuda_time_us"] for k in excluded_cuda_activities
+            ),
             "total_self_cuda_time_us": total_self_cuda_time,
             "cuda_device_event_count": cuda_device_event_count,
             "cuda_time_event_count": cuda_time_event_count,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 from typing import Any, Dict, Optional
 from pathlib import Path
 import json
@@ -19,6 +21,7 @@ from .kernelbench_types import (
 from .kernelbench_helpers import (
     _combine_results,
     _create_paired_tasks,
+    _get_cached_reference_metadata,
     _get_cached_reference_runtime,
     _store_reference_runtime,
     _validate_code,
@@ -31,6 +34,8 @@ from ..core.scheduler import SchedulerAPI
 
 class KernelBenchWorkflowController(WorkflowController):
     """Main controller for KernelBench evaluation workflow."""
+
+    _reference_inflight: Dict[str, "asyncio.Task[Optional[Dict[str, Any]]]"] = {}
 
     async def validate_request(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         eval_task = EvaluationTask.from_dict(input_data)
@@ -131,52 +136,91 @@ class KernelBenchWorkflowController(WorkflowController):
             return result
 
         ref_result: Optional[ReferenceTimingResult] = None
-        if ref_task is None:
+        if eval_task.use_reference_cache and eval_task.uuid:
             cached_runtime = _get_cached_reference_runtime(
                 eval_task.uuid, eval_task.reference_code, eval_task.is_valid
             )
             if cached_runtime is not None:
-                ref_result = self._cached_reference_result(eval_task, cached_runtime)
-            else:
-                    ref_task = ReferenceTimingTask(
-                        task_id=f"{eval_task.task_id}_ref",
-                        base_task_id=eval_task.task_id,
-                        reference_code=eval_task.reference_code,
-                        backend=eval_task.backend,
-                        num_perf_trials=eval_task.num_perf_trials,
-                        timeout=eval_task.timeout,
-                        device=eval_task.device,
-                        priority=eval_task.priority,
-                        entry_point=eval_task.entry_point,
-                        reference_backend=eval_task.reference_backend,
-                        device_preference=eval_task.device_preference,
+                cached_metadata = _get_cached_reference_metadata(
+                    eval_task.uuid, eval_task.reference_code, eval_task.is_valid
+                )
+                # Reference profiles produced before launch-count support may
+                # have a runtime but no compression denominator.  Treat those
+                # cache entries as incomplete, so they are profiled once more.
+                cached_profiling = (cached_metadata or {}).get(
+                    "reference_profiling", {}
+                )
+                cached_launch_count = (cached_metadata or {}).get(
+                    "reference_launch_count"
+                )
+                if cached_launch_count is None:
+                    cached_launch_count = cached_profiling.get(
+                        "kernel_launch_count"
+                    )
+                if cached_launch_count is not None:
+                    ref_result = self._cached_reference_result(
+                        eval_task, cached_runtime, cached_metadata
                     )
 
-        if ref_result is None and ref_task is not None:
-            ref_payload = ref_task.to_dict()
-            ref_payload["task_type"] = "reference_timing"
-            ref_payload["toolkit"] = ref_payload.get("toolkit", "kernelbench")
-            ref_payload["backend_adapter"] = ref_payload.get("backend_adapter", "kernelbench")
-            ref_task_spec = TaskSpec(
-                kind="kernelbench.ref",
-                payload=ref_payload,
-                resources=eval_task.resources,
-                metadata={"base_task_id": eval_task.task_id},
+        if ref_result is None and ref_task is None:
+            ref_task = ReferenceTimingTask(
+                task_id=f"{eval_task.task_id}_ref",
+                base_task_id=eval_task.task_id,
+                reference_code=eval_task.reference_code,
+                backend=eval_task.backend,
+                num_perf_trials=eval_task.num_perf_trials,
+                timeout=eval_task.timeout,
+                device=eval_task.device,
+                priority=eval_task.priority,
+                entry_point=eval_task.entry_point,
+                reference_backend=eval_task.reference_backend,
+                device_preference=eval_task.device_preference,
+                enable_profiling=enable_profiling,
             )
-            ref_task_id = await scheduler.submit(ref_task_spec)
-            ref_result_dict = await scheduler.wait(ref_task_id)
+
+        if ref_result is None and ref_task is not None:
+            if eval_task.use_reference_cache and eval_task.uuid:
+                cache_key = self._reference_cache_key(eval_task)
+                inflight = self._reference_inflight.get(cache_key)
+                if inflight is None:
+                    inflight = asyncio.create_task(
+                        self._run_reference_task(ref_task, eval_task, scheduler)
+                    )
+                    self._reference_inflight[cache_key] = inflight
+                try:
+                    ref_result_dict = await inflight
+                finally:
+                    if self._reference_inflight.get(cache_key) is inflight and inflight.done():
+                        self._reference_inflight.pop(cache_key, None)
+            else:
+                ref_result_dict = await self._run_reference_task(
+                    ref_task, eval_task, scheduler
+                )
             if ref_result_dict:
                 if "error_message" in ref_result_dict and "reference_runtime" not in ref_result_dict:
                     result = self._kernel_only_result(eval_task, kernel_result)
                     self._persist_result(eval_task, result)
                     return result
-                ref_result = ReferenceTimingResult.from_dict(ref_result_dict)
+                shared_ref_result = ReferenceTimingResult.from_dict(ref_result_dict)
+                # A single in-flight reference task may serve several rollout
+                # task IDs. Rebind its identity before combining the pair.
+                ref_result = ReferenceTimingResult(
+                    task_id=f"{eval_task.task_id}_ref",
+                    base_task_id=eval_task.task_id,
+                    reference_runtime=shared_ref_result.reference_runtime,
+                    metadata=dict(shared_ref_result.metadata or {}),
+                    reference_launch_count=shared_ref_result.reference_launch_count,
+                    status=shared_ref_result.status,
+                    error_message=shared_ref_result.error_message,
+                    error_code=shared_ref_result.error_code,
+                )
                 if ref_result.status == "completed":
                     _store_reference_runtime(
                         eval_task.uuid,
                         eval_task.reference_code,
                         eval_task.is_valid,
                         ref_result.reference_runtime,
+                        ref_result.metadata,
                     )
 
         if ref_result is None:
@@ -189,18 +233,59 @@ class KernelBenchWorkflowController(WorkflowController):
         self._persist_result(eval_task, result)
         return result
 
-    def _cached_reference_result(self, eval_task: EvaluationTask, runtime: float) -> ReferenceTimingResult:
+    @staticmethod
+    def _reference_cache_key(eval_task: EvaluationTask) -> str:
+        code_hash = hashlib.sha256(
+            (eval_task.reference_code or "").encode()
+        ).hexdigest()
+        return f"{eval_task.uuid}:{code_hash}:{bool(eval_task.is_valid)}"
+
+    async def _run_reference_task(
+        self,
+        ref_task: ReferenceTimingTask,
+        eval_task: EvaluationTask,
+        scheduler: SchedulerAPI,
+    ) -> Optional[Dict[str, Any]]:
+        ref_payload = ref_task.to_dict()
+        ref_payload["task_type"] = "reference_timing"
+        ref_payload["toolkit"] = ref_payload.get("toolkit", "kernelbench")
+        ref_payload["backend_adapter"] = ref_payload.get(
+            "backend_adapter", "kernelbench"
+        )
+        ref_task_spec = TaskSpec(
+            kind="kernelbench.ref",
+            payload=ref_payload,
+            resources=eval_task.resources,
+            metadata={"base_task_id": eval_task.task_id},
+        )
+        ref_task_id = await scheduler.submit(ref_task_spec)
+        return await scheduler.wait(ref_task_id)
+
+    def _cached_reference_result(
+        self,
+        eval_task: EvaluationTask,
+        runtime: float,
+        cached_metadata: Optional[Dict[str, Any]] = None,
+    ) -> ReferenceTimingResult:
+        metadata = dict(cached_metadata or {})
+        reference_launch_count = metadata.get("reference_launch_count")
+        if reference_launch_count is None:
+            reference_launch_count = (metadata.get("reference_profiling") or {}).get(
+                "kernel_launch_count"
+            )
+        metadata.update(
+            {
+                "cached": True,
+                "uuid": eval_task.uuid,
+                "cache_type": "validation" if eval_task.is_valid else "regular",
+            }
+        )
         return ReferenceTimingResult(
             task_id=f"{eval_task.task_id}_ref",
             base_task_id=eval_task.task_id,
             reference_runtime=runtime,
-            metadata={
-                "cached": True,
-                "uuid": eval_task.uuid,
-                "device": "cached",
-                "backend": eval_task.backend,
-                "cache_type": "validation" if eval_task.is_valid else "regular",
-            },
+            metadata=metadata,
+            reference_launch_count=reference_launch_count,
             status="completed",
         )
 

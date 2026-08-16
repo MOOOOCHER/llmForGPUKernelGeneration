@@ -90,6 +90,13 @@ set -o allexport
 source "${ENV_FILE}"
 set +o allexport
 
+# The workflow reference cache and its in-flight deduplication live in the API
+# process. RL job env files do not set API_WORKERS, so default them to one API
+# process and keep all configured GPU evaluation workers below. Explicit
+# deployments can still opt into multiple API processes.
+API_WORKERS="${API_WORKERS:-1}"
+export API_WORKERS
+
 if [ -z "${LOG_DIR}" ]; then
     LOG_DIR="${LOG_DIR:-logs}"
 fi

@@ -23,6 +23,10 @@ class ReferenceTimingResult:
     base_task_id: str
     reference_runtime: float
     metadata: Dict[str, Any]
+    # Preserve the eager launch count across the reference-task RPC boundary.
+    # This must not depend solely on nested profiling metadata, which can be
+    # omitted by older task/result serializers.
+    reference_launch_count: Optional[float] = None
     status: str = "completed"
     error_message: Optional[str] = None
     error_code: Optional[ErrorCode | str] = None
@@ -212,6 +216,8 @@ class EvaluationResult:
         combined_metadata: Dict[str, Any] = {}
         combined_metadata.update(reference_result.metadata or {})
         combined_metadata.update(kernel_result.metadata or {})
+        if reference_result.reference_launch_count is not None:
+            combined_metadata["reference_launch_count"] = reference_result.reference_launch_count
         combined_metadata["reference_task_id"] = reference_result.task_id
         combined_metadata["kernel_task_id"] = kernel_result.task_id
 

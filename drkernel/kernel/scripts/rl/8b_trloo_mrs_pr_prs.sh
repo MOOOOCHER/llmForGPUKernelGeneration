@@ -13,6 +13,13 @@ RUN_NAME=${RUN_NAME:-"drkernel-8b"}
 REWARD_MANAGER=${REWARD_MANAGER:-kernel_async}
 REWARD_FUNC_NAME=${REWARD_FUNC_NAME:-"calculate_reward_speedup"}
 
+# Resolve the fusion PRS escape threshold at allocation/runtime rather than in
+# the Slurm launcher snapshot. Pending fusion jobs therefore pick up threshold
+# changes without cancellation or resubmission.
+if [[ "${REWARD_FUNC_NAME}" == "calculate_reward_speedup_fusion" ]]; then
+    SPEEDUP_THRESHOLD=1.2
+fi
+
 
 ALGORITHM=${ALGORITHM:-"trloo"}
 

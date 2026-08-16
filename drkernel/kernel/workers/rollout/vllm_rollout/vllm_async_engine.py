@@ -50,7 +50,6 @@ from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
 
 
-from kernel.rewards.fusion_helper import reference_fusion_plans_text
 from kernel.workers.agent import BaseAgent, KernelAgent
 from verl_patch.workers.code.agent_env import (
     BaseEnv,
@@ -1116,7 +1115,7 @@ class MultiTurnAsyncvLLMEngine:
 
         self.fusion_first_turn_prompt = prompt_cfg.get("fusion_first_turn_prompt", None)
         if self.fusion_reward_active and self.fusion_first_turn_prompt:
-            print("[MultiTurnEngine] fusion reward active: first-turn prompts will include reference fusion plans")
+            print("[MultiTurnEngine] fusion reward active: using dataset-provided fusion guidance")
 
         for prompt_config in prompt_cfg.per_turn_prompts:
             per_turn_prompts[prompt_config.name] = {
@@ -1133,24 +1132,11 @@ class MultiTurnAsyncvLLMEngine:
     def maybe_inject_fusion_guidance(
         self, messages: list[dict[str, Any]], ground_truth: str
     ) -> list[dict[str, Any]]:
-        """Append reference fusion-plan guidance to the initial user prompt.
+        """Dataset prompts already carry structured fusion guidance.
 
-        Only active when the fusion reward function is selected; the guidance is
-        injected once, before the request is created, so it stays part of the
-        conversation history for every turn. Samples whose reference has no
-        fusion plans (or cannot be analyzed) are left unchanged.
+        Keep this compatibility hook as a no-op so rollout no longer analyzes
+        reference source with DefragmentationFramework.
         """
-        if not getattr(self, "fusion_reward_active", False) or not self.fusion_first_turn_prompt:
-            return messages
-        if not messages or messages[-1].get("role") != "user":
-            return messages
-        plans_text = reference_fusion_plans_text(ground_truth or "")
-        if plans_text is None:
-            return messages
-        guidance = str(self.fusion_first_turn_prompt).replace("{reference_fusion_plans}", plans_text)
-        # Copy the list and the mutated message so the caller's structures stay untouched.
-        messages = list(messages)
-        messages[-1] = {**messages[-1], "content": f'{messages[-1]["content"]}\n\n{guidance}'}
         return messages
 
     def log_multiturn_messages(

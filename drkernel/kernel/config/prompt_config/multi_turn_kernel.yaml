@@ -17,6 +17,9 @@ per_turn_prompts:
     skip_env: 0.0
     response_truncation: python_code, answer_code
     template: |
+      For heavy operators (GEMM, Linear, BMM, and convolution), choose the implementation strategy most likely to minimize end-to-end runtime: a full custom fusion, a library-backed anchor with profitable surrounding fusion, or separate operations. Do not treat any strategy as preferred by default; account for the concrete shapes, memory traffic, launch overhead, and numerical correctness.
+
+
       Precision requirement: for FP32 matrix multiplication or reductions implemented with `tl.dot`, use `tl.dot(..., input_precision="ieee")` unless the reference implementation explicitly permits TF32 or lower precision.
 
       Return a Triton implementation named `ModelNew` as a single ```python``` block. Let's think step by step.

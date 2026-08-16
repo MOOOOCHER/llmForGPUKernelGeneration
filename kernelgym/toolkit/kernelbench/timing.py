@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from kernelgym.toolkit.kernelbench.profiling import (
+    annotate_launch_count,
     extract_profiling_metrics,
     profiling_context,
 )
@@ -85,7 +86,9 @@ def time_execution_with_cuda_event(
                     kernel_fn(*args)
                 torch.cuda.synchronize(device=device)
 
-            profiling_metrics = extract_profiling_metrics(prof)
+            profiling_metrics = annotate_launch_count(
+                extract_profiling_metrics(prof), num_profiling_trials
+            )
             if profiling_metrics:
                 print(
                     f"[Profiling] Captured {profiling_metrics.get('kernel_count', 0)} CUDA kernels"
@@ -121,7 +124,9 @@ def run_profiling_only(
             for _ in range(num_trials):
                 kernel_fn(*args)
             torch.cuda.synchronize(device=device)
-        profiling_metrics = extract_profiling_metrics(prof)
+        profiling_metrics = annotate_launch_count(
+            extract_profiling_metrics(prof), num_trials
+        )
         if profiling_metrics:
             print(
                 f"[Profiling] Captured {profiling_metrics.get('kernel_count', 0)} CUDA kernels"

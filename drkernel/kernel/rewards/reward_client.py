@@ -196,8 +196,6 @@ class KernelRewardClient:
         # Fusion reward component (normalized execution-group compression).
         fusion_cfg = getattr(reward_config, "fusion_reward", None)
         self.fusion_weight = float(getattr(fusion_cfg, "weight", 0.5))
-        self.fusion_defrag_framework_path = getattr(fusion_cfg, "defrag_framework_path", None)
-        self.fusion_detector = str(getattr(fusion_cfg, "detector", "profiled_export"))
         # Fusion is active when a fusion reward function is selected or explicitly enabled.
         self.fusion_reward_enable = bool(getattr(fusion_cfg, "enable", False)) or (
             str(self.reward_func_name) in self._FUSION_REWARD_FUNC_NAMES
@@ -526,6 +524,7 @@ class KernelRewardClient:
 
         # if self.reward_config.coverage_reward.enable and correctness:
         profiling_reward = 0.0
+        profiling_speed_factor = 0.0
         final_reward = base_speedup_reward
         if correctness:
             coverage_dict = self.compute_coverage_reward(result)
@@ -536,7 +535,10 @@ class KernelRewardClient:
             total_kernel_run_time_in_profiling_us = coverage_dict["total_kernel_run_time_in_profiling_us"]
 
             if self.reward_config.coverage_reward.enable:
-                profiling_reward = self.reward_config.coverage_reward.weight * coverage
+                # Profiling coverage is a fixed bonus for correct, non-regressing
+                # candidates; the base speedup term carries speed magnitude.
+                profiling_speed_factor = 1.0 if float(speedup) >= 1.0 else 0.0
+                profiling_reward = self.reward_config.coverage_reward.weight * coverage * profiling_speed_factor
                 final_reward += profiling_reward
 
         return {
@@ -555,6 +557,7 @@ class KernelRewardClient:
             "speedup_reward": speedup_reward,
             "base_speedup_reward": base_speedup_reward,
             "profiling_reward": profiling_reward,
+            "profiling_speed_factor": profiling_speed_factor,
         }
     
     def calculate_reward_compile_correct_speedup_coverage(self, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -656,8 +659,7 @@ class KernelRewardClient:
             "coverage_reward": coverage_reward,
         }
     
-    # Reward functions that consume the fusion-plan component; compute_batch_rewards
-    # attaches _fusion_reference_code/_fusion_kernel_code only for these.
+    # Reward functions that consume profiler launch compression.
     _FUSION_REWARD_FUNC_NAMES = (
         "calculate_reward_fusion",
         "calculate_reward_speedup_fusion",
@@ -665,20 +667,14 @@ class KernelRewardClient:
     )
 
     def calculate_reward_fusion(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Weighted base reward plus the dataset-defined fusion component."""
-        reference_code = result.pop("_fusion_reference_code", "")
-        kernel_code = result.pop("_fusion_kernel_code", "")
-        sample_extra_info = result.pop("_fusion_sample_extra_info", {})
+        """Weighted base reward plus profiler launch compression."""
         summary = self.calculate_reward_weighted(result)
-        return self._apply_fusion_component(result, summary, reference_code, kernel_code, sample_extra_info)
+        return self._apply_fusion_component(result, summary)
 
     def calculate_reward_speedup_fusion(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Capped continuous speedup reward plus the fusion-plan component."""
-        reference_code = result.pop("_fusion_reference_code", "")
-        kernel_code = result.pop("_fusion_kernel_code", "")
-        sample_extra_info = result.pop("_fusion_sample_extra_info", {})
         summary = self.calculate_reward_speedup(result)
-        return self._apply_fusion_component(result, summary, reference_code, kernel_code, sample_extra_info)
+        return self._apply_fusion_component(result, summary)
 
     def calculate_reward_compile_correct_speedup_coverage_fusion(
         self, result: Dict[str, Any]
@@ -686,33 +682,24 @@ class KernelRewardClient:
         """Dense shaped base (compile/correct/speedup/coverage) plus the
         fusion-plan component, applied under the same policy as
         calculate_reward_fusion (correct kernels only)."""
-        reference_code = result.pop("_fusion_reference_code", "")
-        kernel_code = result.pop("_fusion_kernel_code", "")
-        sample_extra_info = result.pop("_fusion_sample_extra_info", {})
         summary = self.calculate_reward_compile_correct_speedup_coverage(result)
-        return self._apply_fusion_component(result, summary, reference_code, kernel_code, sample_extra_info)
+        return self._apply_fusion_component(result, summary)
 
     def _apply_fusion_component(
         self,
         result: Dict[str, Any],
         summary: Dict[str, Any],
-        reference_code: str,
-        kernel_code: str,
-        sample_extra_info: Dict[str, Any],
     ) -> Dict[str, Any]:
         task_id = result.get("task_id", "")
         correctness = bool(summary.get("correctness", False))
 
         fusion_info = compute_fusion_reward(
-            reference_code,
-            kernel_code,
+            "",
+            "",
             fusion_weight=self.fusion_weight,
             speedup=float(summary.get("speedup", 0.0) or 0.0),
-            defrag_framework_path=self.fusion_defrag_framework_path,
             correctness=correctness,
             profiler_metadata=result.get("metadata", {}),
-            sample_extra_info=sample_extra_info,
-            detector=self.fusion_detector,
         )
         # Only correct kernels earn the fusion component.
         fusion_info.pop("fusion_plan_artifact", None)
@@ -724,8 +711,9 @@ class KernelRewardClient:
                 f"[HybridClient] fusion task_id={task_id} "
                 f"base_speedup_reward={summary.get('base_speedup_reward', 0.0):.4f} "
                 f"profiling_reward={summary.get('profiling_reward', 0.0):.4f} "
-                f"compression_reference_ops={fusion_info['compression_reference_ops']} "
-                f"compression_execution_groups={fusion_info['compression_execution_groups']} "
+                f"profiling_speed_factor={summary.get('profiling_speed_factor', 0.0):.4f} "
+                f"compression_reference_launches={fusion_info['compression_reference_launches']} "
+                f"compression_generated_launches={fusion_info['compression_generated_launches']} "
                 f"compression_ratio={fusion_info['compression_ratio']} "
                 f"compression_gain={fusion_info['compression_gain']:.4f} "
                 f"compression_speed_factor={fusion_info['compression_speed_factor']:.4f} "
@@ -932,12 +920,6 @@ class KernelRewardClient:
         for idx_in_obj, data in results:
             orig_idx = index_map[idx_in_obj]
             reward_func = self._get_reward_func()
-            if getattr(reward_func, "__name__", "") in self._FUSION_REWARD_FUNC_NAMES and isinstance(data, dict):
-                # Fusion plan comparison needs the original codes; the reward
-                # function pops these keys so they never leak into the output.
-                data["_fusion_reference_code"] = tasks[orig_idx].get("reference_code", "")
-                data["_fusion_kernel_code"] = tasks[orig_idx].get("kernel_code", "")
-                data["_fusion_sample_extra_info"] = tasks[orig_idx].get("sample_extra_info", {})
             reward_summary = reward_func(data)
             merged[orig_idx] = self._merge_reward_result(data, reward_summary)
         # Fallback for any missing entries.

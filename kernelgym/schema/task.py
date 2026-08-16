@@ -59,6 +59,7 @@ class ReferenceTimingTask:
     entry_point: str = "Model"
     reference_backend: Optional[str] = None
     device_preference: Optional[str] = None
+    enable_profiling: Optional[bool] = None
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:

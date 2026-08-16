@@ -1732,14 +1732,15 @@ def compute_fusion_reward(
     correctness: bool = False,
     profiler_metadata: Optional[Dict[str, Any]] = None,
     sample_extra_info: Optional[Dict[str, Any]] = None,
-    detector: str = "profiled_export",
+    detector: str = "profiler_launches",
 ) -> Dict[str, Any]:
-    """Compute the correctness-gated, speedup-weighted fusion reward.
+    """Compute correctness-gated launch compression from profiler metadata.
 
-    For a dataset fusion chain with N reference operators and G generated
-    execution groups, gain=(N-G)/(N-1). Each aligned Python/Torch operation or
-    Triton/CUDA call is one group. Thus no compression is 0 and complete fusion
-    is exactly 1, independent of chain length.
+    The eager and generated profiles report CUDA launches per forward. For
+    L_ref eager launches and L_gen generated launches, normalized compression
+    is (L_ref - L_gen) / (L_ref - 1). Complete compression to one launch is
+    therefore 1.0 for every chain length. Source code, export, alignment, and
+    DefragmentationFramework are intentionally not consulted.
     """
     zero = {
         "fusion_reward": 0.0,
@@ -1750,7 +1751,9 @@ def compute_fusion_reward(
         "compression_speed_factor": 0.0,
         "fusion_error": None,
         "compression_skipped_reason": None,
-        "fusion_detector": detector,
+        "compression_reference_launches": None,
+        "compression_generated_launches": None,
+        "fusion_detector": "profiler_launches",
         "fusion_plan_artifact": None,
     }
 
@@ -1758,66 +1761,62 @@ def compute_fusion_reward(
         zero["compression_skipped_reason"] = "incorrect_kernel"
         return zero
 
-    context = FusionDetectionContext(
-        reference_code=reference_code or "",
-        kernel_code=kernel_code or "",
-        correctness=correctness,
-        profiler_metadata=profiler_metadata or {},
-        sample_extra_info=sample_extra_info or {},
-        defrag_framework_path=defrag_framework_path,
+    metadata = profiler_metadata or {}
+    reference_profile = metadata.get("reference_profiling") or {}
+    generated_profile = metadata.get("profiling") or {}
+    try:
+        reference_launch_count = metadata.get("reference_launch_count")
+        if reference_launch_count is None:
+            reference_launch_count = reference_profile["kernel_launch_count"]
+        reference_launches = float(reference_launch_count)
+    except (KeyError, TypeError, ValueError):
+        zero["compression_skipped_reason"] = "missing_reference_launch_count"
+        return zero
+    try:
+        generated_launches = float(generated_profile["kernel_launch_count"])
+    except (KeyError, TypeError, ValueError):
+        zero["compression_skipped_reason"] = "missing_generated_launch_count"
+        return zero
+    if reference_launches <= 1.0:
+        zero["compression_skipped_reason"] = "reference_has_at_most_one_launch"
+        return zero
+    if generated_launches <= 0.0:
+        zero["compression_skipped_reason"] = "generated_has_no_launches"
+        return zero
+
+    compression_ratio = generated_launches / reference_launches
+    compression_gain = max(
+        0.0,
+        min(
+            (reference_launches - generated_launches) / (reference_launches - 1.0),
+            1.0,
+        ),
     )
-    selected_detector = ProfiledExportFusionDetector()
-    detection = selected_detector.detect(context)
-    zero["fusion_plan_artifact"] = detection.artifact()
-    zero["fusion_error"] = detection.error
-    plan = detection.reference_plans[0] if detection.reference_plans else None
-    reference_ops = len(plan.get("semantics", [])) if plan else 0
-    zero["compression_reference_ops"] = reference_ops
-    if detection.skipped_reason:
-        zero["compression_skipped_reason"] = detection.skipped_reason
-        return zero
-    if detection.error:
-        zero["compression_skipped_reason"] = "graph_export_failed"
-        return zero
-
-    group_counts = [
-        int(group_count)
-        for alignment in detection.plan_alignments
-        for group_count in alignment.get("execution_group_counts", [])
-        if int(group_count) > 0
-    ]
-    if not group_counts:
-        zero["compression_skipped_reason"] = "no_execution_group_alignment"
-        return zero
-
-    # Alignment ambiguity does not prevent measurement. If alternative valid
-    # alignments span different group counts, use the conservative larger count
-    # so ambiguity cannot inflate the fusion reward.
-    execution_groups = max(group_counts)
-    compression_ratio = execution_groups / reference_ops
-    compression_gain = (reference_ops - execution_groups) / (reference_ops - 1)
-    # Use the same positive, 3x-capped speedup scale as the base performance
-    # reward. Correct kernels below 1x still receive a compression-learning
-    # signal; faster kernels strengthen it without growing past the configured
-    # DrKernel speedup cap.
-    speed_factor = max(0.0, min(float(speedup), 3.0))
+    # Compression is a fixed bonus once the candidate is actually faster; the
+    # base DrKernel speedup reward remains responsible for speed magnitude.
+    speed_factor = 1.0 if float(speedup) >= 1.0 else 0.0
     fusion_reward = float(fusion_weight) * compression_gain * speed_factor
     zero.update(
         {
             "fusion_reward": fusion_reward,
-            "compression_execution_groups": execution_groups,
+            # Keep the old fields as compatibility aliases for dashboards.
+            "compression_reference_ops": reference_launches,
+            "compression_execution_groups": generated_launches,
+            "compression_reference_launches": reference_launches,
+            "compression_generated_launches": generated_launches,
             "compression_ratio": compression_ratio,
             "compression_gain": compression_gain,
             "compression_speed_factor": speed_factor,
             "compression_skipped_reason": None,
-            "fusion_detector": detection.detector,
+            "fusion_detector": "profiler_launches",
         }
     )
-    zero["fusion_plan_artifact"]["reward"] = {
+    zero["fusion_plan_artifact"] = {
+        "detector": "profiler_launches",
         "fusion_reward": fusion_reward,
         "fusion_weight": float(fusion_weight),
-        "compression_reference_ops": reference_ops,
-        "compression_execution_groups": execution_groups,
+        "compression_reference_launches": reference_launches,
+        "compression_generated_launches": generated_launches,
         "compression_ratio": compression_ratio,
         "compression_gain": compression_gain,
         "compression_speed_factor": speed_factor,

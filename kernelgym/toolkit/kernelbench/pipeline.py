@@ -569,6 +569,7 @@ def eval_reference_only(
     ),
     entry_point: str = "Model",
     reference_backend: Optional[str] = None,
+    enable_profiling: bool = False,
     backend_adapter: Optional[Any] = None,
 ) -> KernelExecResult:
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
@@ -647,17 +648,33 @@ def eval_reference_only(
                     return KernelExecResult(compiled=False, correctness=False, metadata=metadata)
         torch.cuda.synchronize(device=device)
 
-        elapsed_times, _ = time_execution_with_cuda_event(
+        elapsed_times, reference_profiling = time_execution_with_cuda_event(
             model,
             *inputs,
             num_trials=num_perf_trials,
             verbose=verbose,
             device=device,
-            enable_profiling=False,
+            enable_profiling=enable_profiling,
         )
+        if enable_profiling and not reference_profiling.get("kernels"):
+            reference_profiling = run_profiling_only(
+                model,
+                *inputs,
+                num_trials=max(1, min(num_perf_trials, 10)),
+                verbose=verbose,
+                device=device,
+            )
         runtime_stats = get_timing_stats(elapsed_times, device=device)
         metadata["reference_runtime_stats"] = runtime_stats
+        if enable_profiling:
+            metadata["reference_profiling"] = reference_profiling
         metadata["runtime_anchor"] = "median"
+
+        # KernelExecResult/Pydantic takes a copy of ``metadata`` at
+        # construction.  Persist the enriched dictionary explicitly; without
+        # this, reference profiling runs but its launch count never reaches
+        # the reference-timing result or the fusion reward.
+        kernel_exec_result.metadata = metadata
 
         if verbose:
             print(f"[Eval] Performance Stats: {runtime_stats}")
