@@ -1728,6 +1728,7 @@ def compute_fusion_reward(
     *,
     fusion_weight: float = 0.5,
     speedup: float = 0.0,
+    speedup_upper_bound: float = 3.0,
     defrag_framework_path: Optional[str] = None,
     correctness: bool = False,
     profiler_metadata: Optional[Dict[str, Any]] = None,
@@ -1792,9 +1793,12 @@ def compute_fusion_reward(
             1.0,
         ),
     )
-    # Compression is a fixed bonus once the candidate is actually faster; the
-    # base DrKernel speedup reward remains responsible for speed magnitude.
-    speed_factor = 1.0 if float(speedup) >= 1.0 else 0.0
+    # Like coverage, compression scales with measured speedup. Bound the
+    # multiplier to prevent timing outliers from dominating policy gradients.
+    speed_factor = min(
+        max(float(speedup), 0.0),
+        max(0.0, float(speedup_upper_bound)),
+    )
     fusion_reward = float(fusion_weight) * compression_gain * speed_factor
     zero.update(
         {

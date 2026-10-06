@@ -17,7 +17,7 @@ REWARD_FUNC_NAME=${REWARD_FUNC_NAME:-"calculate_reward_speedup"}
 # the Slurm launcher snapshot. Pending fusion jobs therefore pick up threshold
 # changes without cancellation or resubmission.
 if [[ "${REWARD_FUNC_NAME}" == "calculate_reward_speedup_fusion" ]]; then
-    SPEEDUP_THRESHOLD=1.2
+    SPEEDUP_THRESHOLD=${SPEEDUP_THRESHOLD:-1.2}
 fi
 
 

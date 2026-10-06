@@ -89,7 +89,7 @@ class FullProgramPlanTest(unittest.TestCase):
         self.assertIsNone(plan)
         self.assertEqual(reason, "operator_chain_too_short")
 
-    def test_fusion_reward_uses_sub_one_speedup_without_gating(self):
+    def test_fusion_reward_scales_sub_one_speedup(self):
         detection = FUSION_HELPER.FusionDetectionResult(
             detector="profiled_export",
             reference_plans=[{"semantics": ["relu", "sigmoid"]}],

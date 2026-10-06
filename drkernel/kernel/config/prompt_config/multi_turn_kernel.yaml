@@ -17,7 +17,7 @@ per_turn_prompts:
     skip_env: 0.0
     response_truncation: python_code, answer_code
     template: |
-      For heavy operators (GEMM, Linear, BMM, and convolution), choose the implementation strategy most likely to minimize end-to-end runtime: a full custom fusion, a library-backed anchor with profitable surrounding fusion, or separate operations. Do not treat any strategy as preferred by default; account for the concrete shapes, memory traffic, launch overhead, and numerical correctness.
+      For standard PyTorch Linear and convolution operations (nn.Linear, torch.nn.functional.linear, nn.Conv*, nn.ConvTranspose*, and torch.nn.functional.conv*), prefer retaining the library call: its cuBLAS/cuDNN backend is normally faster than a hand-written Triton replacement. Focus custom kernels on profitable surrounding pointwise, normalization, reduction, pooling, or layout work. Replace a Linear or convolution only when the concrete shapes and end-to-end fusion opportunity give a clear reason that it will be faster; preserve the module parameters and exact semantics.
 
 
       Precision requirement: for FP32 matrix multiplication or reductions implemented with `tl.dot`, use `tl.dot(..., input_precision="ieee")` unless the reference implementation explicitly permits TF32 or lower precision.
@@ -35,6 +35,8 @@ per_turn_prompts:
       Here is the server feedback. Please refer to this feedback to improve the implementation:
       Server feedback (status/metrics/errors):
       {feedback}
+
+      When revising, prefer retaining standard PyTorch Linear and convolution calls (nn.Linear, F.linear, nn.Conv*, nn.ConvTranspose*, and F.conv*) because their library backends are normally faster. Improve or fuse the surrounding operations instead unless the feedback and concrete shapes give a clear end-to-end reason to replace the library operation.
 
       Precision requirement: for FP32 matrix multiplication or reductions implemented with `tl.dot`, use `tl.dot(..., input_precision="ieee")` unless the reference implementation explicitly permits TF32 or lower precision.
 

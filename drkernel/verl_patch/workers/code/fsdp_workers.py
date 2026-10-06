@@ -275,12 +275,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import (
-            AutoConfig,
-            AutoModel,
-            AutoModelForCausalLM,
-            AutoModelForVision2Seq,
-        )
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            # Transformers 5 renamed this loader for multimodal causal models.
+            from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
         from verl.utils.model import (
             get_generation_config,
             print_model_size,
@@ -311,8 +311,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        actor_model_config._attn_implementation = (
+            "sdpa" if getattr(actor_model_config, "model_type", None) == "qwen3_5" else "flash_attention_2"
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids

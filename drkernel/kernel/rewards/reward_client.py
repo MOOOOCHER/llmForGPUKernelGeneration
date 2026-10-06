@@ -192,6 +192,11 @@ class KernelRewardClient:
         self.penalty_score = float(reward_config.reward_policy.penalties.penalty_score)
         self.speedup_reward_upper_bound = float(reward_config.speedup_reward_upper_bound)
         self.speedup_reward_lower_bound = float(reward_config.speedup_reward_lower_bound)
+        # Separate cap for coverage/fusion amplification; base speedup retains
+        # its existing reward cap.
+        self.coverage_fusion_speedup_upper_bound = float(
+            getattr(reward_config, "coverage_fusion_speedup_upper_bound", 1.0)
+        )
 
         # Fusion reward component (normalized execution-group compression).
         fusion_cfg = getattr(reward_config, "fusion_reward", None)
@@ -535,10 +540,17 @@ class KernelRewardClient:
             total_kernel_run_time_in_profiling_us = coverage_dict["total_kernel_run_time_in_profiling_us"]
 
             if self.reward_config.coverage_reward.enable:
-                # Profiling coverage is a fixed bonus for correct, non-regressing
-                # candidates; the base speedup term carries speed magnitude.
-                profiling_speed_factor = 1.0 if float(speedup) >= 1.0 else 0.0
-                profiling_reward = self.reward_config.coverage_reward.weight * coverage * profiling_speed_factor
+                # Scale coverage by the bounded measured speedup.  This is
+                # deliberately independent of the base-reward cap.
+                profiling_speed_factor = min(
+                    max(float(speedup), 0.0),
+                    self.coverage_fusion_speedup_upper_bound,
+                )
+                profiling_reward = (
+                    self.reward_config.coverage_reward.weight
+                    * coverage
+                    * profiling_speed_factor
+                )
                 final_reward += profiling_reward
 
         return {
@@ -698,6 +710,7 @@ class KernelRewardClient:
             "",
             fusion_weight=self.fusion_weight,
             speedup=float(summary.get("speedup", 0.0) or 0.0),
+            speedup_upper_bound=self.coverage_fusion_speedup_upper_bound,
             correctness=correctness,
             profiler_metadata=result.get("metadata", {}),
         )

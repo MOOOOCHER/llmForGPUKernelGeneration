@@ -451,8 +451,17 @@ except Exception as e:
                     "REDIS_HOST", "REDIS_PORT", "REDIS_KEY_PREFIX",
                     "API_HOST", "API_PORT", "GPU_DEVICES", "NODE_ID",
                     "KERNELGYM_TASK_ARCHIVE_DIR", "PYTHONPATH",
+                    "TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR",
+                    "XDG_CACHE_HOME", "CUDA_CACHE_PATH",
+                    "PYTORCH_KERNEL_CACHE_PATH", "TORCH_EXTENSIONS_DIR",
                 )
                 cmd = ["enroot", "start", "--root", "--mount", f"{repo_root}:{repo_root}"]
+                for name in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "XDG_CACHE_HOME",
+                             "CUDA_CACHE_PATH", "PYTORCH_KERNEL_CACHE_PATH", "TORCH_EXTENSIONS_DIR"):
+                    cache_path = process_env.get(name)
+                    if cache_path:
+                        Path(cache_path).mkdir(parents=True, exist_ok=True)
+                        cmd.extend(["--mount", f"{cache_path}:{cache_path}"])
                 for name in pass_env:
                     if name in process_env:
                         cmd.extend(["--env", name])

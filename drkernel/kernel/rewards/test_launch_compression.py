@@ -44,7 +44,7 @@ class LaunchCompressionRewardTest(unittest.TestCase):
             profiler_metadata=metadata(3, 2),
         )
         self.assertEqual(result["compression_gain"], 0.5)
-        self.assertEqual(result["fusion_reward"], 0.25)
+        self.assertEqual(result["fusion_reward"], 0.5)
 
     def test_no_or_negative_compression_is_zero(self):
         for generated_launches in (3, 4):
@@ -67,10 +67,10 @@ class LaunchCompressionRewardTest(unittest.TestCase):
             fusion_weight=0.5,
             profiler_metadata=metadata(4, 1),
         )
-        self.assertEqual(result["compression_speed_factor"], 0.0)
-        self.assertEqual(result["fusion_reward"], 0.0)
+        self.assertEqual(result["compression_speed_factor"], 0.99)
+        self.assertEqual(result["fusion_reward"], 0.495)
 
-    def test_above_one_speedup_uses_fixed_factor(self):
+    def test_above_one_speedup_uses_clipped_magnitude(self):
         result = compute_fusion_reward(
             "",
             "",

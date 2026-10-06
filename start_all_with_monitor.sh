@@ -207,6 +207,14 @@ for gpu in ${GPU_LIST}; do
             "${WORKER_ENROOT_ROOT}/data" \
             "${WORKER_ENROOT_ROOT}/runtime" \
             "${WORKER_ENROOT_ROOT}/tmp"
+        CACHE_MOUNT_ARGS=()
+        for cache_var in TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR XDG_CACHE_HOME; do
+            cache_path="${!cache_var:-}"
+            if [[ -n "${cache_path}" ]]; then
+                mkdir -p "${cache_path}"
+                CACHE_MOUNT_ARGS+=(--mount "${cache_path}:${cache_path}")
+            fi
+        done
         env \
             ENROOT_CACHE_PATH="${KERNELGYM_ENROOT_ROOT}/cache" \
             ENROOT_DATA_PATH="${WORKER_ENROOT_ROOT}/data" \
@@ -215,6 +223,7 @@ for gpu in ${GPU_LIST}; do
             enroot start \
                 --root \
                 --mount "${ROOT_DIR}:${ROOT_DIR}" \
+                "${CACHE_MOUNT_ARGS[@]}" \
                 --env REDIS_HOST \
                 --env REDIS_PORT \
                 --env REDIS_PASSWORD \
@@ -225,6 +234,10 @@ for gpu in ${GPU_LIST}; do
                 --env NODE_ID \
                 --env KERNELGYM_TASK_ARCHIVE_DIR \
                 --env PYTHONPATH \
+                --env TRITON_CACHE_DIR \
+                --env TORCHINDUCTOR_CACHE_DIR \
+                --env XDG_CACHE_HOME \
+                --env CUDA_CACHE_PATH \
                 "${KERNELGYM_WORKER_CONTAINER}" \
                 python -m kernelgym.worker.single_worker \
                     --worker-id "${WORKER_ID}" \
