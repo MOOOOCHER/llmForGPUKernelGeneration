@@ -1,0 +1,4 @@
+torch>=2.1
+ortools>=9.10
+pandas>=2.0
+pyarrow>=14.0
