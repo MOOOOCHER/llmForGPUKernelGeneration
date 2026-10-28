@@ -151,6 +151,24 @@ if ! port_is_open "${REDIS_HOST}" "${REDIS_PORT}"; then
     sleep 2
 fi
 
+# An open Redis port is not sufficient: a restored RDB can still be loading.
+# Do not silently lose expected-worker registration while Redis is loading.
+python - <<'PY'
+import os, time, redis
+r = redis.Redis(host=os.environ['REDIS_HOST'], port=int(os.environ['REDIS_PORT']),
+                password=os.environ.get('REDIS_PASSWORD') or None,
+                socket_connect_timeout=2, socket_timeout=2)
+for attempt in range(60):
+    try:
+        if r.ping():
+            break
+    except redis.RedisError:
+        pass
+    time.sleep(1)
+else:
+    raise SystemExit('ERROR: Redis did not become ready for worker registration')
+PY
+
 echo "Starting API server..."
 python -m kernelgym.server.api.server > "${ROOT_DIR}/${LOG_DIR}/api_server.log" 2>&1 &
 API_PID=$!
@@ -193,13 +211,19 @@ fi
 
 if command -v redis-cli >/dev/null 2>&1; then
     redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" "${REDIS_AUTH_ARGS[@]}" --no-auth-warning \
-        DEL "${REDIS_KEY_PREFIX}:expected_workers" > /dev/null 2>&1 || true
+        DEL "${REDIS_KEY_PREFIX}:expected_workers" > /dev/null
 fi
 
 echo "Starting GPU workers..."
 for gpu in ${GPU_LIST}; do
     WORKER_ID="worker_gpu_${gpu}"
     echo "Launching ${WORKER_ID} on cuda:${gpu}"
+    # Start workers serially; cold GPFS/FUSE mounts can fail transiently when
+    # launched together. Preserve every failed attempt and retry only workers
+    # that exited before registering. Never duplicate a live slow worker.
+    WORKER_READY=no
+    for worker_attempt in 1 2 3; do
+    echo "Startup attempt ${worker_attempt}: ${WORKER_ID}"
     if [[ -n "${KERNELGYM_WORKER_CONTAINER}" ]]; then
         WORKER_ENROOT_ROOT="${KERNELGYM_ENROOT_ROOT}/jobs/kernelgym-${SLURM_JOB_ID:-manual}/${WORKER_ID}"
         mkdir -p \
@@ -243,30 +267,101 @@ for gpu in ${GPU_LIST}; do
                     --worker-id "${WORKER_ID}" \
                     --device "cuda:${gpu}" \
                     --persistent \
-            > "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
+            >> "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
     else
         python -m kernelgym.worker.single_worker \
             --worker-id "${WORKER_ID}" --device "cuda:${gpu}" --persistent \
-            > "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
+            >> "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
     fi
     WORKER_PID=$!
     WORKER_PIDS+=("${WORKER_PID}")
     write_pid_file
 
-    if command -v redis-cli >/dev/null 2>&1; then
-        redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" "${REDIS_AUTH_ARGS[@]}" --no-auth-warning \
-            SADD "${REDIS_KEY_PREFIX}:expected_workers" "${WORKER_ID}" > /dev/null 2>&1 || true
-        redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" "${REDIS_AUTH_ARGS[@]}" --no-auth-warning \
-            HSET "${REDIS_KEY_PREFIX}:expected_worker:${WORKER_ID}" \
-            device "cuda:${gpu}" hostname "$(hostname)" node_id "${NODE_ID:-}" > /dev/null 2>&1 || true
-        redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" "${REDIS_AUTH_ARGS[@]}" --no-auth-warning \
-            HSET "${REDIS_KEY_PREFIX}:worker_process:${WORKER_ID}" \
-            pid "${WORKER_PID}" start_time "$(date -Iseconds)" device "cuda:${gpu}" > /dev/null 2>&1 || true
+    echo "Worker PID: ${WORKER_PID}"
+    if python - "${WORKER_ID}" "${WORKER_PID}" <<'PY'
+import os, sys, time, redis
+wid, pid = sys.argv[1], int(sys.argv[2])
+r = redis.Redis(host=os.environ['REDIS_HOST'], port=int(os.environ['REDIS_PORT']),
+                password=os.environ.get('REDIS_PASSWORD') or None,
+                socket_connect_timeout=2, socket_timeout=2, decode_responses=True)
+key = os.environ['REDIS_KEY_PREFIX'] + ':worker:' + wid
+deadline = time.monotonic() + 90
+while time.monotonic() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        sys.exit(1)
+    try:
+        info = r.hgetall(key)
+        if info.get('online') == 'true' and info.get('status') == 'online':
+            sys.exit(0)
+    except redis.RedisError:
+        pass
+    time.sleep(1)
+raise SystemExit('ERROR: live worker did not register within 90 seconds')
+PY
+    then
+        WORKER_READY=yes
+        break
+    fi
+    if kill -0 "${WORKER_PID}" 2>/dev/null; then
+        echo "ERROR: ${WORKER_ID} is alive but not ready; refusing a duplicate launch"
+        exit 1
+    fi
+    wait "${WORKER_PID}" 2>/dev/null || true
+    sleep "$((worker_attempt * 2))"
+    done
+    if [[ "${WORKER_READY}" != yes ]]; then
+        echo "ERROR: ${WORKER_ID} failed all startup attempts"
+        tail -n 30 "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log"
+        exit 1
     fi
 
-    echo "Worker PID: ${WORKER_PID}"
-    sleep 0.3
+    # Publish recovery metadata only after the worker is online, preventing
+    # the monitor from racing the bounded startup retries above.
+    python - "${WORKER_ID}" "${WORKER_PID}" "${gpu}" <<'PY'
+import os, sys, time, socket, datetime, redis
+wid, pid, gpu = sys.argv[1:]
+r = redis.Redis(host=os.environ['REDIS_HOST'], port=int(os.environ['REDIS_PORT']),
+                password=os.environ.get('REDIS_PASSWORD') or None,
+                socket_connect_timeout=2, socket_timeout=2, decode_responses=True)
+prefix = os.environ['REDIS_KEY_PREFIX']
+for attempt in range(30):
+    try:
+        with r.pipeline(transaction=True) as pipe:
+            pipe.sadd(prefix + ':expected_workers', wid)
+            pipe.hset(prefix + ':expected_worker:' + wid, mapping={
+                'device': 'cuda:' + gpu, 'hostname': socket.gethostname(),
+                'node_id': os.environ.get('NODE_ID', '')})
+            pipe.hset(prefix + ':worker_process:' + wid, mapping={
+                'pid': pid, 'device': 'cuda:' + gpu,
+                'start_time': datetime.datetime.now().isoformat()})
+            pipe.execute()
+        if r.sismember(prefix + ':expected_workers', wid) and r.hget(prefix + ':worker_process:' + wid, 'pid') == pid:
+            break
+    except redis.RedisError:
+        pass
+    time.sleep(1)
+else:
+    raise SystemExit('ERROR: could not verify recovery metadata for ' + wid)
+PY
 done
+
+python - ${GPU_LIST} <<'PY'
+import os, sys, redis
+r = redis.Redis(host=os.environ['REDIS_HOST'], port=int(os.environ['REDIS_PORT']),
+                password=os.environ.get('REDIS_PASSWORD') or None,
+                socket_connect_timeout=2, socket_timeout=2, decode_responses=True)
+prefix = os.environ['REDIS_KEY_PREFIX']
+expected = {'worker_gpu_' + gpu for gpu in sys.argv[1:]}
+registered = r.smembers(prefix + ':expected_workers')
+missing = [wid for wid in expected if wid not in registered or
+           r.hget(prefix + ':worker:' + wid, 'online') != 'true' or
+           r.hget(prefix + ':worker:' + wid, 'status') != 'online']
+if missing:
+    raise SystemExit('ERROR: expected workers not online: ' + ', '.join(sorted(missing)))
+print('Verified all ' + str(len(expected)) + ' expected GPU workers online with recovery metadata')
+PY
 
 echo "KernelGym started."
 echo "Logs: ${ROOT_DIR}/${LOG_DIR}"

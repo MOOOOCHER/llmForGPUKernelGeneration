@@ -51,6 +51,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 
 from kernel.workers.agent import BaseAgent, KernelAgent
+from kernel.workers.rollout.vllm_rollout.kernel_history import build_kernel_history
 from verl_patch.workers.code.agent_env import (
     BaseEnv,
     FinishReasonTypeEnum,
@@ -1057,6 +1058,13 @@ class MultiTurnAsyncvLLMEngine:
         # Agent and environment configuration
         self.agent_type = config.rollout.multi_turn.get("agent_type", "MathAgent")
         self.env_type = config.rollout.multi_turn.get("env_type", "MathSandboxEnv")
+        # Explicit override, independent of per-turn prompt-rule matching.
+        # None preserves the legacy behavior for existing jobs/configurations.
+        self.history_mode = config.rollout.multi_turn.get("history_mode", None)
+        if self.history_mode not in (None, "all", "initial+last_kernel"):
+            raise ValueError(f"Unsupported multi_turn.history_mode: {self.history_mode}")
+        if self.history_mode == "initial+last_kernel" and self.agent_type != "KernelAgent":
+            raise ValueError("initial+last_kernel requires KernelAgent")
         self.per_turn_prompts = self.load_per_turn_prompts()
 
         # Calculate expected environment max timeout, this is for final timeout handling, which includes max_retry and timeout
@@ -1539,7 +1547,7 @@ class MultiTurnAsyncvLLMEngine:
 
                 print(f"Prompt Template: {prompt_template}")
                 
-                if history_mode == "all":
+                if self.history_mode is not None or history_mode == "all":
                     messages = req.messages
                 elif history_mode.startswith("initial+recent"):
                     suffix = history_mode[len("initial+recent") :]
@@ -1567,6 +1575,13 @@ class MultiTurnAsyncvLLMEngine:
                             # messages.append({"role": "user", "content": env_feedback_with_prompt})
                             messages[-1]["content"] = env_feedback_with_prompt
         
+        if self.history_mode == "initial+last_kernel":
+            messages = build_kernel_history(
+                messages, req.response_turns,
+                lambda response: agent._extract_answer_block(response)
+                or agent._extract_python_code(response),
+            )
+
         prompt_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
 
         # Prepare parameters

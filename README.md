@@ -699,3 +699,10 @@ This project is licensed under the Apache License 2.0 - see the LICENSE file for
 
 ## Acknowledgement
 This repo is based on [VERL](https://github.com/verl-project/verl) and [KernelBench](https://github.com/ScalingIntelligence/KernelBench).
+
+## Thesis KernelBench evaluator snapshot
+
+The thesis evaluator source is bundled under [`kernelbench/`](kernelbench/SNAPSHOT.md),
+including the local precision, timing, and evaluation changes, benchmark tasks,
+tests, and upstream license. The snapshot manifest records the base revision
+and file checksums. See its snapshot notes for environment and artifact scope.

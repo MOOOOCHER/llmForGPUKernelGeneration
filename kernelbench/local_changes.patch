@@ -1,0 +1,971 @@
+diff --git a/scripts/eval_from_generations.py b/scripts/eval_from_generations.py
+index 6fac151..ce5c5ce 100644
+--- a/scripts/eval_from_generations.py
++++ b/scripts/eval_from_generations.py
+@@ -30,7 +30,41 @@ from kernelbench.utils import read_file, set_gpu_arch
+ from tqdm import tqdm
+ 
+ # Modal support
+-import modal
++try:
++    import modal
++    MODAL_AVAILABLE = True
++except ImportError:
++    MODAL_AVAILABLE = False
++
++    class _UnavailableModalImage:
++        @classmethod
++        def from_registry(cls, *_args, **_kwargs):
++            return cls()
++
++        def __getattr__(self, _name):
++            return lambda *_args, **_kwargs: self
++
++    class _UnavailableModalApp:
++        def __init__(self, *_args, **_kwargs):
++            pass
++
++        def cls(self, *_args, **_kwargs):
++            return lambda target: target
++
++    class _UnavailableModalRetries:
++        def __init__(self, *_args, **_kwargs):
++            pass
++
++    class _UnavailableModal:
++        App = _UnavailableModalApp
++        Image = _UnavailableModalImage
++        Retries = _UnavailableModalRetries
++
++        @staticmethod
++        def method(*_args, **_kwargs):
++            return lambda target: target
++
++    modal = _UnavailableModal()
+ 
+ """
+ Batch Evaluation from Existing Generations
+@@ -121,6 +155,9 @@ class EvalConfig(Config):
+         self.num_perf_trials = 100
+         self.timeout = 180  # in seconds
+         self.measure_performance = True
++        self.measure_compile_reference = False
++        self.compile_reference_backend = "inductor"
++        self.compile_reference_mode = "default"
+         self.timing_method = "cuda_event"
+ 
+         # Eval Flow setting
+@@ -324,6 +361,9 @@ def evaluate_single_sample(
+             device=device,
+             backend=configs.backend,
+             precision=eval.get_torch_dtype_from_string(configs.precision),
++            measure_compile_reference=configs.measure_compile_reference,
++            compile_reference_backend=configs.compile_reference_backend,
++            compile_reference_mode=configs.compile_reference_mode,
+         )
+         return eval_result
+     except Exception as e:
+@@ -443,6 +483,9 @@ def batch_eval_modal(
+     run_dir: str,
+     eval_file_path: str,
+ ):
++    if not MODAL_AVAILABLE:
++        raise RuntimeError("Modal evaluation requested, but the modal package is not installed")
++
+     print(f"[Modal] Starting batch evaluation on {config.gpu} GPUs")
+     print(f"[Modal] Processing {len(total_work)} samples in parallel batches of {config.num_gpu_devices}")
+     
+@@ -715,7 +758,12 @@ def check_if_eval_exists_local(
+     if os.path.exists(eval_file_path):
+         with open(eval_file_path, "r") as f:
+             eval_results = json.load(f)
+-        return str(problem_id) in eval_results
++        problem_results = eval_results.get(str(problem_id), [])
++        return any(
++            result.get("sample_id") == sample_id
++            for result in problem_results
++            if isinstance(result, dict)
++        )
+     return False
+ 
+ 
+@@ -726,6 +774,17 @@ def add_to_eval_results_file(
+     Add evaluation result to eval results file
+     TODO: migrate database support
+     """
++    # Some compilation failures are returned as None by lower-level evaluators.
++    # Record them as failed evaluations instead of crashing the entire run.
++    if eval_result is None:
++        eval_result = KernelExecResult(
++            compiled=False,
++            correctness=False,
++            metadata={"error": "Evaluation returned no result"},
++            runtime=-1.0,
++            runtime_stats={},
++        )
++
+     # Load existing results if file exists
+     if os.path.exists(eval_file_path):
+         with open(eval_file_path, "r") as f:
+@@ -743,6 +802,10 @@ def add_to_eval_results_file(
+             "metadata": check_metadata_serializable_all_types(eval_result.metadata),
+             "runtime": eval_result.runtime,
+             "runtime_stats": eval_result.runtime_stats,
++            "ref_runtime": eval_result.ref_runtime,
++            "ref_runtime_stats": eval_result.ref_runtime_stats,
++            "ref_compile_runtime": eval_result.ref_compile_runtime,
++            "ref_compile_runtime_stats": eval_result.ref_compile_runtime_stats,
+         }
+     )
+ 
+@@ -811,7 +874,18 @@ def main(config: EvalConfig):
+ 
+     all_problem_ids = dataset.get_problem_ids()
+ 
+-    if config.subset == (None, None):
++    if config.problem_ids is not None:
++        requested_problem_ids = {int(problem_id) for problem_id in config.problem_ids}
++        problem_ids_to_run = [
++            problem_id for problem_id in all_problem_ids if problem_id in requested_problem_ids
++        ]
++        missing_problem_ids = requested_problem_ids - set(problem_ids_to_run)
++        if missing_problem_ids:
++            raise ValueError(
++                f"Requested problem IDs are not present in level {config.level}: "
++                f"{sorted(missing_problem_ids)}"
++            )
++    elif config.subset == (None, None):
+         problem_ids_to_run = all_problem_ids
+     else:
+         start, end = config.subset
+diff --git a/src/kernelbench/eval.py b/src/kernelbench/eval.py
+index 3557dc9..6dcfe8d 100644
+--- a/src/kernelbench/eval.py
++++ b/src/kernelbench/eval.py
+@@ -22,6 +22,12 @@ import torch.nn as nn
+ from pydantic import BaseModel
+ 
+ from . import timing, dataset
++from .precision import (
++    enforce_strict_fp32,
++    sanitize_strict_fp32_source,
++    verify_strict_fp32,
++)
++from .kernel_static_checker import check_precision_downgrade
+ 
+ REPO_TOP_PATH = os.path.abspath(
+     os.path.join(
+@@ -119,6 +125,8 @@ class KernelExecResult(BaseModel):
+     # could do eager for level 1 and compile for level 2 and 3
+     ref_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
+     ref_runtime_stats: dict = {} # only recorded if we decide to measure performance
++    ref_compile_runtime: float = -1.0
++    ref_compile_runtime_stats: dict = {}
+ 
+ 
+ def load_original_model_and_inputs(
+@@ -410,6 +418,9 @@ def eval_kernel_against_ref(
+     # Guard against potential reward hacking [optional but ongoing enhancement]
+     check_for_excessive_speedup: bool = True,
+     excessive_speedup_threshold: float = 10, # flag if the kernel is more than <excessive_speedup_threshold>x faster than the reference
++    measure_compile_reference: bool = False,
++    compile_reference_backend: str = "inductor",
++    compile_reference_mode: str = "default",
+ ) -> KernelExecResult:
+     """
+     Evaluate the custom kernel against the original model
+@@ -460,6 +471,21 @@ def eval_kernel_against_ref(
+     metadata = {}  # for storing result metadata
+     metadata["hardware"] = torch.cuda.get_device_name(device=device)
+     metadata["device"] = str(device)  # for debugging
++    strict_fp32 = precision == torch.float32
++    if strict_fp32:
++        custom_model_src, fp32_source_rewrites = sanitize_strict_fp32_source(
++            custom_model_src
++        )
++        metadata["fp32_source_rewrites"] = fp32_source_rewrites
++        precision_downgrade, precision_error = check_precision_downgrade(
++            custom_model_src, precision="fp32"
++        )
++        if precision_downgrade:
++            metadata["compilation_error_name"] = "PrecisionDowngradeError"
++            metadata["compilation_error"] = precision_error
++            metadata["precision_downgrade_rejected"] = True
++            return KernelExecResult(compiled=False, metadata=metadata)
++        enforce_strict_fp32(metadata)
+ 
+     if uses_tempfile:
+         # need to set env var for triton/cute code to guarantee no wrong device shenanigans
+@@ -520,6 +546,9 @@ def eval_kernel_against_ref(
+         else:
+             # Default CUDA backend
+             ModelNew = load_custom_model(custom_model_src, context, build_dir)
++        if strict_fp32:
++            # Candidate module import is untrusted and can mutate global math mode.
++            enforce_strict_fp32(metadata)
+         torch.cuda.synchronize(device=device)  # not sure if this is too much
+     except Exception as e:
+         print(
+@@ -558,8 +587,13 @@ def eval_kernel_against_ref(
+     # at this point we passed compilation
+     try:
+         with torch.no_grad():
++            if strict_fp32:
++                enforce_strict_fp32(metadata)
+             set_seed(seed_num)  # set seed for reproducible weights
+             custom_model = ModelNew(*init_inputs)
++            if strict_fp32:
++                # Candidate __init__ is untrusted too.
++                enforce_strict_fp32(metadata)
+             assert hasattr(custom_model, "forward")
+             original_model = original_model.to(device=device, dtype=precision)
+             custom_model = custom_model.to(device=device, dtype=precision)
+@@ -584,6 +618,8 @@ def eval_kernel_against_ref(
+     if verbose:
+         print("[Eval] Checking Correctness")
+     try:
++        if strict_fp32:
++            enforce_strict_fp32(metadata)
+         kernel_exec_result = run_and_check_correctness(
+             original_model,
+             custom_model,
+@@ -619,6 +655,8 @@ def eval_kernel_against_ref(
+                 
+                 model_new = custom_model.to(device=device, dtype=precision)
+                 torch.cuda.synchronize(device=device)
++                if strict_fp32:
++                    enforce_strict_fp32(metadata)
+ 
+                 # support multiple timing backend
+                 timing_fn = timing.get_timing_function(timing_method)
+@@ -629,11 +667,13 @@ def eval_kernel_against_ref(
+                     verbose=verbose,
+                     device=device,
+                 )
++                if strict_fp32:
++                    verify_strict_fp32()
+                 runtime_stats = timing.get_timing_stats(elapsed_times, device=device)
+ 
+                 if verbose:
+                     print(f"[Eval] Performance Stats: {runtime_stats}")
+-                kernel_exec_result.runtime = runtime_stats["mean"]
++                kernel_exec_result.runtime = runtime_stats["median"]
+                 kernel_exec_result.runtime_stats = runtime_stats
+ 
+         except Exception as e:
+@@ -651,7 +691,14 @@ def eval_kernel_against_ref(
+     # We are working on preventing excessive speedup issues
+     ##############################################################
+ 
+-    if measure_performance and check_for_excessive_speedup:  # experimental: hence able to shut off codepath if needed
++    should_measure_reference = (
++        measure_performance
++        and kernel_exec_result is not None
++        and kernel_exec_result.correctness
++        and kernel_exec_result.runtime > 0
++        and (check_for_excessive_speedup or measure_compile_reference)
++    )
++    if should_measure_reference:
+     
+         if verbose:
+             print("[Eval] Additional checks to flag excessive speedup")
+@@ -664,6 +711,10 @@ def eval_kernel_against_ref(
+         
+         model_new = custom_model.to(device=device, dtype=precision)
+         torch.cuda.synchronize(device=device)
++        if strict_fp32:
++            # Candidate timing may have changed process-global state. Restore it
++            # before measuring either eager or compiled references.
++            enforce_strict_fp32(metadata)
+ 
+         # time PyTorch reference function
+         # same timing_fn as specified from before
+@@ -676,23 +727,57 @@ def eval_kernel_against_ref(
+             device=device,
+         )
+         reference_runtime_stats = timing.get_timing_stats(reference_elapsed_times, device=device)
+-        kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
++        kernel_exec_result.ref_runtime = reference_runtime_stats["median"]
+         kernel_exec_result.ref_runtime_stats = reference_runtime_stats
+ 
+-        # Compute Effective Speedup
+-        effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
++        if measure_compile_reference:
++            try:
++                if strict_fp32:
++                    enforce_strict_fp32(metadata)
++                torch._dynamo.reset()
++                compiled_reference_model = torch.compile(
++                    original_model,
++                    backend=compile_reference_backend,
++                    mode=compile_reference_mode,
++                )
++                compiled_reference_elapsed_times = timing_fn(
++                    compiled_reference_model,
++                    inputs,
++                    num_trials=num_perf_trials,
++                    verbose=verbose,
++                    device=device,
++                )
++                compiled_reference_runtime_stats = timing.get_timing_stats(
++                    compiled_reference_elapsed_times,
++                    device=device,
++                )
++                kernel_exec_result.ref_compile_runtime = (
++                    compiled_reference_runtime_stats["median"]
++                )
++                kernel_exec_result.ref_compile_runtime_stats = (
++                    compiled_reference_runtime_stats
++                )
++            except Exception as error:
++                kernel_exec_result.metadata["compile_reference_error"] = str(error)
++                kernel_exec_result.metadata["compile_reference_error_name"] = (
++                    get_error_name(error)
++                )
++
++        if check_for_excessive_speedup:
++            # Compute Effective Speedup
++            effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
+ 
+-        # TODO: integrate SoL estimation for each unique program on designated hardware
+-        # for now, we will use a heuristics such as 5-10x which is very hard to achieve
++            # TODO: integrate SoL estimation for each unique program on designated hardware
++            # for now, we will use a heuristics such as 5-10x which is very hard to achieve
+ 
+-        if verbose:
+-            print(f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}")
++            if verbose:
++                print(f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}")
+ 
+-        if effective_speedup > excessive_speedup_threshold:
+-            kernel_exec_result.metadata["excessive_speedup"] = True
+-            
+-            print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
+-            print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
++            if effective_speedup > excessive_speedup_threshold:
++                kernel_exec_result.metadata["excessive_speedup"] = True
++                
++                print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
++                print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
+ 
+ 
+     graceful_eval_cleanup(context, device, tempfile)
+@@ -774,13 +859,19 @@ def run_and_check_correctness(
+      
+             model_new = new_model_instance.to(device=device, dtype=precision)
+ 
++            if precision == torch.float32:
++                enforce_strict_fp32(metadata)
+             output = model(*inputs)
+             torch.cuda.synchronize(device=device)
+             # ensure all GPU operations are completed before checking results
+ 
+             try:
++                if precision == torch.float32:
++                    enforce_strict_fp32(metadata)
+                 output_new = model_new(*inputs)
+                 torch.cuda.synchronize(device=device)
++                if precision == torch.float32:
++                    verify_strict_fp32()
+                 if output.shape != output_new.shape:
+                     metadata = register_and_format_exception(
+                         "correctness_issue",
+@@ -909,4 +1000,4 @@ def check_metadata_serializable_all_types(metadata: dict):
+ # if __name__ == "__main__":
+ # fetch_kernel_from_database("kernelbench_prompt_v2_level_2", 1, 1, "http://localhost:9091")
+ # print(fetch_ref_arch_from_level_problem_id("2", 1, with_name=True))
+-# Note: fetch_baseline_time is available in kernelbench.timing module
+\ No newline at end of file
++# Note: fetch_baseline_time is available in kernelbench.timing module
+diff --git a/src/kernelbench/kernel_static_checker.py b/src/kernelbench/kernel_static_checker.py
+index 7d97eff..ccde4ac 100644
+--- a/src/kernelbench/kernel_static_checker.py
++++ b/src/kernelbench/kernel_static_checker.py
+@@ -458,7 +458,7 @@ def check_timing_event_patch(code: str) -> Tuple[bool, str]:
+ # We use explicit, high-confidence patterns that indicate intentional precision
+ # downgrading. These patterns have minimal false positives and clear semantic intent.
+ 
+-# Specific patterns that indicate FP32 -> FP16 precision downgrading
++# Specific patterns that indicate FP32 -> FP16/BF16 precision downgrading
+ FP32_TO_FP16_PATTERNS = [
+     # ========== CUDA / CUDA C++ ==========
+     # 1.1 Explicit float -> half intrinsics (⭐ gold standard)
+@@ -476,7 +476,8 @@ FP32_TO_FP16_PATTERNS = [
+     # ========== Triton (Python) ==========
+     # 2.1 Explicit tl.astype(..., tl.float16) (⭐ best signal)
+     # tl.astype(x, tl.float16)
+-    r"tl\.astype\s*\(\s*[^,]+,\s*tl\.float16\s*\)",
++    r"tl\.astype\s*\(\s*[^,]+,\s*tl\.(float16|bfloat16)\s*\)",
++    r"\.to\s*\(\s*tl\.(float16|bfloat16)\b",
+     
+     # ========== CUTLASS ==========
+     # 3.1 NumericConverter float -> half (⭐ extremely reliable)
+@@ -501,8 +502,9 @@ FP32_TO_FP16_PATTERNS = [
+     # PyTorch explicit casts (common in inline CUDA contexts)
+     r"\.half\s*\(",                              # .half() -> FP16
+     r"\.float16\s*\(",                           # .float16() -> FP16
+-    r"\.to\s*\(\s*torch\.(float16|half)\b",      # .to(torch.float16)
+-    r"\.to\s*\(\s*dtype\s*=\s*torch\.(float16|half)\b",  # .to(dtype=torch.float16)
++    r"\.to\s*\(\s*torch\.(float16|half|bfloat16)\b",      # .to(torch.float16)
++    r"\.to\s*\(\s*dtype\s*=\s*torch\.(float16|half|bfloat16)\b",  # .to(dtype=torch.float16)
++    r"\bdtype\s*=\s*torch\.(float16|half|bfloat16)\b",
+ ]
+ 
+ def check_precision_downgrade(code: str, precision: str = "fp32") -> Tuple[bool, str]:
+@@ -513,8 +515,7 @@ def check_precision_downgrade(code: str, precision: str = "fp32") -> Tuple[bool,
+     which can make kernels faster but with reduced precision. This is a reward
+     hacking pattern where models cheat on timing while appearing correct.
+     
+-    Currently only checks for FP32 -> FP16 downgrades. Other precision combinations
+-    (e.g., FP16 -> BF16) are not flagged.
++    Checks explicit FP32 -> FP16 or BF16 downgrades.
+     
+     Args:
+         code: Kernel source code
+@@ -542,13 +543,44 @@ def check_precision_downgrade(code: str, precision: str = "fp32") -> Tuple[bool,
+     if precision != "fp32":
+         return (False, "")
+     
+-    # Check for FP16 patterns
++    # Check for lower-precision patterns
+     for pattern in FP32_TO_FP16_PATTERNS:
+         if re.search(pattern, code):
+-            return (True, "Precision downgrade detected: required FP32 but code uses FP16")
++            return (
++                True,
++                "Precision downgrade detected: required FP32 but code uses FP16/BF16",
++            )
+     
+     return (False, "")
+ 
++
++# Explicit math-mode changes defeat evaluator-owned IEEE FP32 even when all
++# tensors remain torch.float32. Triton also defaults FP32 tl.dot to TF32 unless
++# TRITON_F32_DEFAULT=ieee is imposed by the evaluator.
++NON_IEEE_FP32_PATTERNS = [
++    r"set_float32_matmul_precision\s*\(\s*['\"](?:high|medium)['\"]\s*\)",
++    r"(?:cuda\.matmul|cudnn)\.allow_tf32\s*=\s*True\b",
++    r"\binput_precision\s*=\s*['\"](?:tf32|tf32x3)['\"]",
++    r"\ballow_tf32\s*=\s*True\b",
++    r"TRITON_F32_DEFAULT['\"]?\s*\]?\s*=\s*['\"](?:tf32|tf32x3)['\"]",
++]
++
++
++def check_strict_fp32_math(code: str, precision: str = "fp32") -> Tuple[bool, str]:
++    """Reject explicit TF32/reduced-FP32 math-mode requests in FP32 evals."""
++    normalized = precision.lower()
++    if normalized not in {"fp32", "float32"}:
++        return (False, "")
++
++    uncommented = _strip_comments(code)
++    for pattern in NON_IEEE_FP32_PATTERNS:
++        if re.search(pattern, uncommented, flags=re.IGNORECASE):
++            return (
++                True,
++                "Non-IEEE FP32 math mode detected: TF32 or reduced FP32 is forbidden",
++            )
++    return (False, "")
++
+ # =============================================================================
+ # In the future, we can add a AST-based checker and a LM-as-a-judge checker
+ # =============================================================================
+@@ -574,6 +606,7 @@ CHECK_FUNCTIONS: Dict[str, Union[Callable[[str], Tuple[bool, str]], Callable[[st
+     "thread_injection": check_thread_injection,
+     "lazy_eval": check_lazy_eval,
+     "precision_downgrade": check_precision_downgrade,  # precision-dependent
++    "strict_fp32_math": check_strict_fp32_math,  # precision-dependent
+     
+     # Backend-specific implementation checks
+     # should be strict
+@@ -586,7 +619,7 @@ CHECK_FUNCTIONS: Dict[str, Union[Callable[[str], Tuple[bool, str]], Callable[[st
+ }
+ 
+ # Checks that require additional parameters beyond just code
+-PRECISION_DEPENDENT_CHECKS = {"precision_downgrade"}
++PRECISION_DEPENDENT_CHECKS = {"precision_downgrade", "strict_fp32_math"}
+ 
+ # Here are some presets for you to use
+ # You are welcome to adapt them to your settings
+@@ -618,6 +651,7 @@ WARNING_CHECKS: List[str] = [
+     "torch_computation_ops",  
+     "stream_injection",       # could have legitimate uses (async ops), but should be careful!
+     "precision_downgrade",    # precision downgrading - can be intentional but often a hack
++    "strict_fp32_math",       # standalone eval sanitizes these requests to IEEE
+ ]
+ 
+ 
+diff --git a/src/kernelbench/timing.py b/src/kernelbench/timing.py
+index f22920b..6faf37e 100644
+--- a/src/kernelbench/timing.py
++++ b/src/kernelbench/timing.py
+@@ -5,6 +5,8 @@ import time
+ from typing import Any, Optional, Union
+ import os
+ 
++from kernelbench.precision import enforce_strict_fp32
++
+ 
+ def measure_ref_program_time(
+     ref_arch_name: str,
+@@ -58,16 +60,27 @@ def measure_ref_program_time(
+             else:
+                 precision_dtype = precision
+ 
++            if precision_dtype == torch.float32:
++                enforce_strict_fp32()
+ 
+             # set model weights and inputs to specified precision
+-            inputs = [
+-                x.to(device=device, dtype=precision_dtype) if isinstance(x, torch.Tensor) else x
+-                for x in inputs
+-            ]
+-            init_inputs = [
+-                x.to(device=device, dtype=precision_dtype) if isinstance(x, torch.Tensor) else x
+-                for x in init_inputs
+-            ]
++            #
++            # Only floating-point tensors are cast. Integer tensors are indices,
++            # not values: level1/95_CrossEntropyLoss passes int64 class targets
++            # from torch.randint, and casting those to fp32/bf16 makes
++            # cross_entropy fail with the misleading
++            #   "nll_loss_forward_reduce_cuda_kernel_2d_index" not implemented for 'Float'
++            # which reports the target dtype, not the predictions'. They still
++            # move to the device, just without a dtype change.
++            def _to_precision(x):
++                if not isinstance(x, torch.Tensor):
++                    return x
++                if x.is_floating_point():
++                    return x.to(device=device, dtype=precision_dtype)
++                return x.to(device=device)
++
++            inputs = [_to_precision(x) for x in inputs]
++            init_inputs = [_to_precision(x) for x in init_inputs]
+ 
+             model = Model(*init_inputs)
+             model = model.to(device=device, dtype=precision_dtype)
+@@ -89,6 +102,8 @@ def measure_ref_program_time(
+                 print(f"Using PyTorch Eager Execution on {ref_arch_name}")
+ 
+             torch.cuda.synchronize(device=device)
++            if precision_dtype == torch.float32:
++                enforce_strict_fp32()
+ 
+             timing_fn = get_timing_function(timing_method)
+             elapsed_times = timing_fn(
+@@ -612,10 +627,12 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
+ 
+     stats = {
+         "mean": float(f"{np.mean(elapsed_times):.3g}"),
++        "median": float(f"{np.median(elapsed_times):.3g}"),
+         "std": float(f"{np.std(elapsed_times):.3g}"),
+         "min": float(f"{np.min(elapsed_times):.3g}"),
+         "max": float(f"{np.max(elapsed_times):.3g}"),
+         "num_trials": len(elapsed_times),
++        "runtime_anchor": "median",
+     }
+ 
+     if device:
+@@ -623,4 +640,3 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
+         stats["device"] = str(device)  # for debugging
+ 
+     return stats
+-
+diff --git a/src/kernelbench/unit_tests/test_eval_timing.py b/src/kernelbench/unit_tests/test_eval_timing.py
+index 470c425..a108ae9 100644
+--- a/src/kernelbench/unit_tests/test_eval_timing.py
++++ b/src/kernelbench/unit_tests/test_eval_timing.py
+@@ -156,4 +156,3 @@ def test_do_bench_simple_smoke():
+     times = do_bench(fn, warmup=2, rep=rep, return_mode="all")
+     assert isinstance(times, list)
+     assert len(times) == rep
+-
+diff --git a/src/kernelbench/unit_tests/test_precision.py b/src/kernelbench/unit_tests/test_precision.py
+index 1e8a229..4b433b6 100644
+--- a/src/kernelbench/unit_tests/test_precision.py
++++ b/src/kernelbench/unit_tests/test_precision.py
+@@ -2,12 +2,9 @@
+ Unit tests for precision downgrade detection in FP32 kernels.
+ 
+ Tests the check_precision_downgrade function to ensure it correctly detects
+-various patterns that indicate precision downgrading (FP32 -> FP16),
++various patterns that indicate precision downgrading (FP32 -> FP16/BF16),
+ which is a reward hacking pattern.
+ 
+-Note: The current implementation only checks for FP32 -> FP16 downgrades,
+-not BF16 downgrades.
+-
+ Run with pytest:
+     pytest src/kernelbench/unit_tests/test_precision.py -v
+     or
+@@ -94,6 +91,24 @@ def test_fp32_to_dtype_half():
+     assert "FP16" in message
+ 
+ 
++def test_fp32_to_torch_bfloat16():
++    """Test detection of a PyTorch BF16 cast."""
++    detected, message = check_precision_downgrade(
++        "x = x.to(torch.bfloat16)", precision="fp32"
++    )
++    assert detected is True
++    assert "BF16" in message
++
++
++def test_fp32_to_triton_bfloat16():
++    """Test detection of a Triton BF16 cast."""
++    detected, message = check_precision_downgrade(
++        "x = tl.load(ptr).to(tl.bfloat16)", precision="fp32"
++    )
++    assert detected is True
++    assert "BF16" in message
++
++
+ # ============================================================================
+ # Test Cases for FP32 -> FP16 Precision Downgrades (CUDA patterns)
+ # ============================================================================
+diff --git a/src/kernelbench/unit_tests/test_validate_kernel_static.py b/src/kernelbench/unit_tests/test_validate_kernel_static.py
+index f439462..df34c67 100644
+--- a/src/kernelbench/unit_tests/test_validate_kernel_static.py
++++ b/src/kernelbench/unit_tests/test_validate_kernel_static.py
+@@ -52,6 +52,71 @@ def test_validate_kernel_static_defaults():
+     assert isinstance(warnings, list)
+ 
+ 
++@pytest.mark.parametrize(
++    "precision_override",
++    [
++        'torch.set_float32_matmul_precision("high")',
++        "torch.backends.cuda.matmul.allow_tf32 = True",
++        "torch.backends.cudnn.allow_tf32 = True",
++        'value = tl.dot(a, b, input_precision="tf32")',
++        'value = tl.dot(a, b, input_precision="tf32x3")',
++        "value = tl.dot(a, b, allow_tf32=True)",
++        'os.environ["TRITON_F32_DEFAULT"] = "tf32"',
++    ],
++)
++def test_fp32_warns_on_non_ieee_math_modes(precision_override):
++    code = f"""
++import triton
++import triton.language as tl
++
++@triton.jit
++def kernel(a, b):
++    _guard = tl.zeros((1,), tl.float32)
++    {precision_override}
++"""
++    valid, errors, warnings = validate_kernel_static(
++        code,
++        backend="triton",
++        precision="fp32",
++    )
++    assert valid, errors
++    assert any("Non-IEEE FP32" in warning for warning in warnings)
++
++
++def test_fp32_allows_default_dot_under_evaluator_ieee_default():
++    code = """
++import triton
++import triton.language as tl
++
++@triton.jit
++def kernel(a, b):
++    value = tl.dot(a, b)
++"""
++    valid, errors, _ = validate_kernel_static(
++        code,
++        backend="triton",
++        precision="fp32",
++    )
++    assert valid, errors
++
++
++def test_non_fp32_allows_backend_specific_math_mode():
++    code = """
++import triton
++import triton.language as tl
++
++@triton.jit
++def kernel(a, b):
++    value = tl.dot(a, b, input_precision="tf32")
++"""
++    valid, errors, _ = validate_kernel_static(
++        code,
++        backend="triton",
++        precision="fp16",
++    )
++    assert valid, errors
++
++
+ # ============================================================================
+ # Test Precision Parameter Passing
+ # ============================================================================
+@@ -420,4 +485,3 @@ def test_precision_check_respects_forbidden():
+ 
+ if __name__ == "__main__":
+     pytest.main([__file__, "-v"])
+-
+diff --git a/src/kernelbench/precision.py b/src/kernelbench/precision.py
+new file mode 100644
+index 0000000..d256f1d
+--- /dev/null
++++ b/src/kernelbench/precision.py
+@@ -0,0 +1,155 @@
++"""Evaluator-owned floating-point math-mode controls."""
++
++from __future__ import annotations
++
++import os
++import re
++from typing import Any, MutableMapping
++
++import torch
++
++
++_STRICT_FP32_SOURCE_REWRITES = [
++    (
++        re.compile(
++            r"(\.to\s*\(\s*)(torch|tl)\.(?:float16|half|bfloat16)\b",
++            re.IGNORECASE,
++        ),
++        r"\1\2.float32",
++        "explicit_lower_precision_to_cast",
++    ),
++    (
++        re.compile(
++            r"(\.to\s*\(\s*dtype\s*=\s*)torch\.(?:float16|half|bfloat16)\b",
++            re.IGNORECASE,
++        ),
++        r"\1torch.float32",
++        "explicit_lower_precision_to_dtype_cast",
++    ),
++    (
++        re.compile(
++            r"(\bdtype\s*=\s*)torch\.(?:float16|half|bfloat16)\b",
++            re.IGNORECASE,
++        ),
++        r"\1torch.float32",
++        "explicit_lower_precision_dtype",
++    ),
++    (
++        re.compile(
++            r"(tl\.astype\s*\(\s*[^,]+,\s*)tl\.(?:float16|bfloat16)\b",
++            re.IGNORECASE,
++        ),
++        r"\1tl.float32",
++        "triton_lower_precision_astype",
++    ),
++    (
++        re.compile(r"\.half\s*\(\s*\)", re.IGNORECASE),
++        ".float()",
++        "torch_half_method",
++    ),
++    (
++        re.compile(
++            r"(set_float32_matmul_precision\s*\(\s*)['\"](?:high|medium)['\"](\s*\))",
++            re.IGNORECASE,
++        ),
++        r'\1"highest"\2',
++        "torch_float32_matmul_precision",
++    ),
++    (
++        re.compile(
++            r"((?:cuda\.matmul|cudnn)\.allow_tf32\s*=\s*)True\b",
++            re.IGNORECASE,
++        ),
++        r"\1False",
++        "torch_backend_allow_tf32",
++    ),
++    (
++        re.compile(
++            r"(\binput_precision\s*=\s*)['\"](?:tf32|tf32x3)['\"]",
++            re.IGNORECASE,
++        ),
++        r'\1"ieee"',
++        "triton_dot_input_precision",
++    ),
++    (
++        re.compile(r"(\ballow_tf32\s*=\s*)True\b", re.IGNORECASE),
++        r"\1False",
++        "triton_dot_allow_tf32",
++    ),
++    (
++        re.compile(
++            r"((?:os\.)?environ\s*\[\s*['\"]TRITON_F32_DEFAULT['\"]\s*\]\s*=\s*)"
++            r"['\"](?:tf32|tf32x3)['\"]",
++            re.IGNORECASE,
++        ),
++        r'\1"ieee"',
++        "triton_f32_environment",
++    ),
++]
++
++
++def sanitize_strict_fp32_source(source: str) -> tuple[str, list[str]]:
++    """Rewrite safe reduced-precision opt-ins to their IEEE FP32 equivalents.
++
++    This handles explicit PyTorch/Triton FP16 and BF16 casts as well as TF32
++    math-mode requests. Native CUDA/CUTLASS half operations are intentionally
++    not rewritten because token substitution cannot preserve their semantics.
++    """
++    rewritten = source
++    applied: list[str] = []
++    for pattern, replacement, label in _STRICT_FP32_SOURCE_REWRITES:
++        rewritten, count = pattern.subn(replacement, rewritten)
++        if count:
++            applied.append(f"{label}:{count}")
++    return rewritten, applied
++
++
++def get_strict_fp32_state() -> dict[str, Any]:
++    """Return the process-global settings relevant to IEEE FP32 evaluation."""
++    return {
++        "fp32_math_mode": "ieee",
++        "float32_matmul_precision": torch.get_float32_matmul_precision(),
++        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
++        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
++        "triton_f32_default": os.environ.get("TRITON_F32_DEFAULT"),
++    }
++
++
++def enforce_strict_fp32(
++    metadata: MutableMapping[str, Any] | None = None,
++) -> dict[str, Any]:
++    """Force IEEE FP32 matmul/convolution semantics for an evaluation process.
++
++    Candidate modules execute arbitrary import-time Python and can mutate
++    PyTorch's process-global math mode. Call this before and after importing a
++    candidate, and immediately before each correctness or timing phase.
++
++    Triton 3.x defaults FP32 ``tl.dot`` to TF32. ``TRITON_F32_DEFAULT=ieee``
++    changes that default; standalone KernelBench sanitizes explicit candidate
++    TF32 requests before this state is enforced.
++    """
++    os.environ["TRITON_F32_DEFAULT"] = "ieee"
++    torch.set_float32_matmul_precision("highest")
++    torch.backends.cuda.matmul.allow_tf32 = False
++    torch.backends.cudnn.allow_tf32 = False
++
++    state = get_strict_fp32_state()
++    if metadata is not None:
++        metadata.update(state)
++    return state
++
++
++def verify_strict_fp32() -> None:
++    """Fail if candidate execution changed evaluator-owned math-mode state."""
++    state = get_strict_fp32_state()
++    valid = (
++        state["float32_matmul_precision"] == "highest"
++        and state["cuda_matmul_allow_tf32"] is False
++        and state["cudnn_allow_tf32"] is False
++        and state["triton_f32_default"] == "ieee"
++    )
++    if not valid:
++        enforce_strict_fp32()
++        raise RuntimeError(
++            f"Candidate changed evaluator-owned IEEE FP32 math mode: {state}"
++        )
+diff --git a/src/kernelbench/unit_tests/test_median_timing.py b/src/kernelbench/unit_tests/test_median_timing.py
+new file mode 100644
+index 0000000..4afdc85
+--- /dev/null
++++ b/src/kernelbench/unit_tests/test_median_timing.py
+@@ -0,0 +1,9 @@
++from kernelbench import timing
++
++
++def test_timing_stats_save_median_as_runtime_anchor():
++    stats = timing.get_timing_stats([1.0, 1.0, 1.0, 100.0])
++
++    assert stats["mean"] == 25.8
++    assert stats["median"] == 1.0
++    assert stats["runtime_anchor"] == "median"
+diff --git a/src/kernelbench/unit_tests/test_strict_fp32.py b/src/kernelbench/unit_tests/test_strict_fp32.py
+new file mode 100644
+index 0000000..47ef899
+--- /dev/null
++++ b/src/kernelbench/unit_tests/test_strict_fp32.py
+@@ -0,0 +1,84 @@
++import os
++
++import torch
++
++import pytest
++
++from kernelbench.precision import (
++    enforce_strict_fp32,
++    sanitize_strict_fp32_source,
++    verify_strict_fp32,
++)
++
++
++def test_enforce_strict_fp32_restores_process_global_state():
++    os.environ["TRITON_F32_DEFAULT"] = "tf32"
++    torch.set_float32_matmul_precision("high")
++    torch.backends.cuda.matmul.allow_tf32 = True
++    torch.backends.cudnn.allow_tf32 = True
++
++    metadata = {}
++    state = enforce_strict_fp32(metadata)
++
++    assert torch.get_float32_matmul_precision() == "highest"
++    assert torch.backends.cuda.matmul.allow_tf32 is False
++    assert torch.backends.cudnn.allow_tf32 is False
++    assert os.environ["TRITON_F32_DEFAULT"] == "ieee"
++    assert state == metadata
++    assert state["fp32_math_mode"] == "ieee"
++
++
++def test_verify_strict_fp32_rejects_runtime_mutation_and_restores_state():
++    enforce_strict_fp32()
++    torch.set_float32_matmul_precision("high")
++
++    with pytest.raises(RuntimeError, match="changed evaluator-owned"):
++        verify_strict_fp32()
++
++    assert torch.get_float32_matmul_precision() == "highest"
++
++
++def test_sanitize_strict_fp32_source_rewrites_explicit_opt_ins():
++    source = """
++torch.set_float32_matmul_precision("high")
++torch.backends.cuda.matmul.allow_tf32 = True
++torch.backends.cudnn.allow_tf32 = True
++os.environ["TRITON_F32_DEFAULT"] = "tf32"
++x = tl.dot(a, b, input_precision="tf32x3")
++y = tl.dot(c, d, allow_tf32=True)
++"""
++    rewritten, applied = sanitize_strict_fp32_source(source)
++
++    assert 'set_float32_matmul_precision("highest")' in rewritten
++    assert rewritten.count("allow_tf32 = False") == 2
++    assert 'TRITON_F32_DEFAULT"] = "ieee"' in rewritten
++    assert 'input_precision="ieee"' in rewritten
++    assert "allow_tf32=False" in rewritten
++    assert len(applied) == 5
++
++
++def test_sanitize_strict_fp32_source_leaves_default_dot_unchanged():
++    source = "x = tl.dot(a, b)"
++    rewritten, applied = sanitize_strict_fp32_source(source)
++    assert rewritten == source
++    assert applied == []
++
++
++def test_sanitize_strict_fp32_source_rewrites_fp16_and_bf16_casts():
++    source = """
++a = x.to(torch.float16)
++b = x.to(dtype=torch.bfloat16)
++c = tl.load(ptr).to(tl.bfloat16)
++d = tl.astype(c, tl.float16)
++e = torch.empty(4, dtype=torch.half)
++f = x.half()
++"""
++    rewritten, applied = sanitize_strict_fp32_source(source)
++
++    assert "float16" not in rewritten
++    assert "bfloat16" not in rewritten
++    assert "torch.half" not in rewritten
++    assert ".half()" not in rewritten
++    assert rewritten.count("torch.float32") == 4
++    assert rewritten.count("tl.float32") == 2
++    assert len(applied) == 5

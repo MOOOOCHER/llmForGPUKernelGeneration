@@ -389,7 +389,18 @@ run_grading() {
     metrics_arg="data.metrics_output_path=$METRICS_OUTPUT_PATH"
   fi
 
+  # Optional override; absent means legacy per-turn history behavior unchanged.
+  local -a history_mode_args=()
+  if [[ -n "${ROLLOUT_HISTORY_MODE:-}" ]]; then
+    case "${ROLLOUT_HISTORY_MODE}" in
+      all|initial+last_kernel) ;;
+      *) echo "Invalid ROLLOUT_HISTORY_MODE: ${ROLLOUT_HISTORY_MODE}" >&2; return 2 ;;
+    esac
+    history_mode_args+=("++actor_rollout_ref.rollout.multi_turn.history_mode=${ROLLOUT_HISTORY_MODE}")
+  fi
+
   PYTHONUNBUFFERED=1 python -m kernel.main_grading \
+      "${history_mode_args[@]}" \
       ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS:-8} \
       data.path=$EVAL_DATASET \
       data.output_path=$OUTPUT_PATH \

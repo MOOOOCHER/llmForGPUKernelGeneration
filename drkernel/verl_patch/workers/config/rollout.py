@@ -62,6 +62,8 @@ class MultiTurnConfig(BaseConfig):
     env_type: str = "MathSandboxEnv"
     rollout_save_jsonl: Optional[str] = None
     prompt_config_path: Optional[str] = None
+    # Opt-in generation-context override; None preserves per-turn prompt rules.
+    history_mode: Optional[str] = None
     mask_void_turn: bool = True
     multi_iteration: Optional[dict] = None
     # Mirrors reward_model.reward_func_name (via yaml interpolation) so the rollout
