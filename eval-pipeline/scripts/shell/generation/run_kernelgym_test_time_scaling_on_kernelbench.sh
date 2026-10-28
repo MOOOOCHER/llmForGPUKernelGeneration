@@ -6,7 +6,7 @@ set -euo pipefail
 
 KERNELGYM_ROOT="${KERNELGYM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "${KERNELGYM_ROOT}/.." && pwd)}"
-DRKERNEL_ROOT="${KERNELGYM_ROOT}/drkernel"
+DRKERNEL_ROOT="${KERNELGYM_ROOT}/rl-training"
 KERNELGYM_EVAL_DIR="${DRKERNEL_ROOT}/kernel/scripts/eval"
 RUN_CACHE="${RUN_CACHE:-$WORKSPACE_ROOT/cache/kernelgym/kernelbench_tts/${SLURM_JOB_ID:-manual}}"
 
@@ -31,7 +31,7 @@ DATAPROTO_PATH="${DATAPROTO_PATH:-}"
 
 MODEL_NAME="${MODEL_NAME:-drkernel-8b-coldstart}"
 if [[ -z "${MODEL_PATH:-}" ]]; then
-  COLDSTART_MODEL_PATH="${COLDSTART_MODEL_PATH:-$WORKSPACE_ROOT/models/hkust-nlp/drkernel-8b-coldstart}"
+  COLDSTART_MODEL_PATH="${COLDSTART_MODEL_PATH:-$WORKSPACE_ROOT/models/sft-cold-start}"
   if [[ -d "$COLDSTART_MODEL_PATH" ]]; then
     MODEL_PATH="$COLDSTART_MODEL_PATH"
   else

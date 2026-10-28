@@ -80,7 +80,7 @@ mkdir -p "${VLLM_CONFIG_ROOT}" "${TRANSFORMERS_CACHE}"
 KB_LEVEL="${KB_LEVEL:-1}"
 EVAL_DATASET="${EVAL_DATASET:-${REPO_ROOT}/Results/Kernelbench/kernelgym_datasets/kernelbench_level${KB_LEVEL}_for_kernelgym.parquet}"
 
-MODEL_PATH="${MODEL_PATH:-${REPO_ROOT}/models/hkust-nlp/drkernel-8b}"
+MODEL_PATH="${MODEL_PATH:-${REPO_ROOT}/models/drkernel-8b}"
 MODEL_NAME="${MODEL_NAME:-drkernel-8b}"
 MODEL_TAG="$(printf '%s' "${MODEL_NAME}" | sed -E 's#[^A-Za-z0-9._-]+#_#g')"
 RUN_NAME="${RUN_NAME:-kbtts_${MODEL_TAG}_level${KB_LEVEL}_${SLURM_JOB_ID}}"
@@ -120,7 +120,7 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
   exit 1
 fi
 
-# The standard env is a uv venv (the cluster disables pip, so drkernel/setup.sh
+# The standard env is a uv venv (the cluster disables pip, so rl-training/setup.sh
 # can't be used as-is). Qwen3.8-27B-FP8 uses the newer qwen3_5 architecture and
 # needs its model-specific Torch/Transformers/vLLM stack.
 PYTHON_ENV="${PYTHON_ENV:-${REPO_ROOT}/.venv-drkernel}"
@@ -132,8 +132,8 @@ if [[ ! -x "${PYTHON_ENV}/bin/python" ]]; then
   exit 1
 fi
 source "${PYTHON_ENV}/bin/activate"
-# The checkout contains the verl package at drkernel/verl/verl; put that inner source root first so import verl resolves to the real package.
-export PYTHONPATH="${KERNELGYM_ROOT}/drkernel/verl:${KERNELGYM_ROOT}/drkernel:${PYTHONPATH:-}"
+# The checkout contains the verl package at rl-training/verl/verl; put that inner source root first so import verl resolves to the real package.
+export PYTHONPATH="${KERNELGYM_ROOT}/rl-training/verl:${KERNELGYM_ROOT}/rl-training:${PYTHONPATH:-}"
 PYTHON_BIN="${PYTHON_ENV}/bin/python"
 echo "Python environment: ${PYTHON_ENV}"
 

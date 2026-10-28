@@ -32,9 +32,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Default location: sibling checkout of the KernelGYM repo.
-# .../daniel/KernelGYM/drkernel/kernel/rewards/fusion_helper.py -> .../daniel/DefragmentationFramework
-_DEFAULT_DEFRAG_ROOT = Path(__file__).resolve().parents[4] / "DefragmentationFramework"
+# Default location: archived checkout under the workspace root.
+# .../daniel/KernelGYM/rl-training/kernel/rewards/fusion_helper.py -> .../daniel/archive/DefragmentationFramework
+_DEFAULT_DEFRAG_ROOT = Path(__file__).resolve().parents[4] / "archive" / "DefragmentationFramework"
 _DEFAULT_REFERENCE_CACHE_ROOT = (
     Path(__file__).resolve().parents[4]
     / "Results"

@@ -102,9 +102,9 @@ if [[ -e "${TARGET_DIR}" && "${OVERWRITE:-0}" != "1" ]]; then
 fi
 
 # The env is a uv venv (the cluster disables pip). verl 0.5.0.dev0 is installed
-# editable from KernelGYM/drkernel/verl, so activation alone provides
+# editable from KernelGYM/rl-training/verl, so activation alone provides
 # `python -m verl.model_merger`; no PYTHONPATH needed.
-export PYTHONPATH="${KERNELGYM_ROOT:-${REPO_ROOT}/KernelGYM}/drkernel/verl:${PYTHONPATH:-}"
+export PYTHONPATH="${KERNELGYM_ROOT:-${REPO_ROOT}/KernelGYM}/rl-training/verl:${PYTHONPATH:-}"
 source "${REPO_ROOT}/.venv-drkernel/bin/activate"
 
 # CPU-only node: make sure torch never tries to touch CUDA, and keep temp files

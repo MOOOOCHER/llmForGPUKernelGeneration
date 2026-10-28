@@ -318,7 +318,7 @@ reward_model:
     enable: false
     detector: "profiled_export"
     weight: 0.5                 # multiplied by normalized compression gain and clipped speedup factor
-    defrag_framework_path: null # defaults to the DefragmentationFramework checkout next to KernelGYM
+    defrag_framework_path: null # defaults to the archived DefragmentationFramework checkout under daniel/archive
 
   # Performance evaluation
   num_perf_trials: 100

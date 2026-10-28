@@ -16,7 +16,7 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
   exit 2
 fi
 
-python drkernel/kernel/scripts/preprocess/push_to_hub.py \
+python rl-training/kernel/scripts/preprocess/push_to_hub.py \
   --repo_id "${HF_REPO}" \
   --local_path "${LOCALPATH}" \
   --repo_type "${REPOTYPE}" \
