@@ -18,3 +18,28 @@ __pycache__/
 logs/
 outputs/
 dump.rdb
+
+# Local runtime artifacts and manual backups
+*.rdb
+.pytest_cache/
+.triton_cache/
+*.orig
+*.before-*
+*.startupfix-*
+
+# Include the canonical thesis RL dataset bundle.
+!/dataset/
+
+# Track only the curated RL dataset bundle.
+/dataset/*
+!/dataset/README.md
+!/dataset/stage1/
+/dataset/stage1/*
+!/dataset/stage1/stage1.parquet
+!/dataset/stage1/stage1_stats.json
+!/dataset/stage1/stage1_generation_metadata.json
+!/dataset/stage2/
+/dataset/stage2/*
+!/dataset/stage2/stage2.parquet
+!/dataset/stage2/stage2_stats.json
+!/dataset/stage2/stage2_generation_metadata.json

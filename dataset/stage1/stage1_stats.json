@@ -1,0 +1,39 @@
+{
+  "total": 10000,
+  "by_program_op_count": {
+    "5": 2833,
+    "3": 2834,
+    "4": 2833,
+    "2": 1500
+  },
+  "by_structured": {
+    "True": 10000
+  },
+  "by_anchor_family": {
+    "normalization": 1152,
+    "matrix": 2148,
+    "reduction": 752,
+    "conv": 1748,
+    "cumulative": 948,
+    "softmax": 1152,
+    "pooling": 1348,
+    "pointwise": 752
+  },
+  "by_fusion_type": {
+    "stage2_recipe_single": 4000,
+    "prologue": 1578,
+    "two_anchor_region": 1308,
+    "epilogue": 1575,
+    "prologue_anchor_epilogue": 787,
+    "chain": 752
+  },
+  "by_curriculum_source": {
+    "stage2_recipe_single": 4000,
+    "stage1_base": 6000
+  },
+  "by_workload_bucket": {
+    "small": 2000,
+    "large": 4000,
+    "medium": 4000
+  }
+}

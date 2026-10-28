@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "kind": "stage2",
+  "generator_profile": "stage2-recipes-v10-softmax-10-no-reduction-primary",
+  "seed": 43,
+  "total_samples": 25000,
+  "data_source": "balanced_csp_dag"
+}

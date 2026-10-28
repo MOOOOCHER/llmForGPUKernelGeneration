@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "kind": "stage1",
+  "generator_profile": "stage1-60base-40compact-stage2-recipes-v1-no-fusion-prompt",
+  "seed": 42,
+  "total_samples": 10000,
+  "data_source": "balanced_csp_dag"
+}
