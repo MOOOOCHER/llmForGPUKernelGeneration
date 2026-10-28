@@ -1,0 +1,262 @@
+diff --git a/verl/utils/dataset/multiturn_sft_dataset.py b/verl/utils/dataset/multiturn_sft_dataset.py
+index 0d38fdd8..c5169ac2 100644
+--- a/verl/utils/dataset/multiturn_sft_dataset.py
++++ b/verl/utils/dataset/multiturn_sft_dataset.py
+@@ -16,6 +16,7 @@
+ Multi-turn SFT dataset that supports training on conversation data with multiple turns
+ """
+ 
++import json
+ import logging
+ from typing import Any, Optional
+ 
+@@ -43,6 +44,22 @@ def convert_nested_value_to_list_recursive(data_item):
+         return data_item
+ 
+ 
++def decode_json_list(data_item, field_name: str, default_empty: bool = False):
++    """Decode JSON-list parquet fields while preserving native nested values."""
++    if data_item is None or (
++        isinstance(data_item, (float, np.floating)) and np.isnan(data_item)
++    ):
++        if default_empty:
++            return []
++        raise ValueError(f"{field_name} must not be null")
++    if isinstance(data_item, str):
++        data_item = json.loads(data_item)
++    data_item = convert_nested_value_to_list_recursive(data_item)
++    if not isinstance(data_item, list):
++        raise ValueError(f"{field_name} must decode to a list, got {type(data_item).__name__}")
++    return data_item
++
++
+ class MultiTurnSFTDataset(Dataset):
+     """
+     Dataset for multi-turn conversations where each assistant response should be trained
+@@ -92,16 +109,28 @@ class MultiTurnSFTDataset(Dataset):
+         self.dataframe = pd.concat(dataframes)
+ 
+         # Extract messages list from dataframe
+-        self.messages = self.dataframe[self.messages_key].apply(series_to_item).tolist()
++        self.messages = (
++            self.dataframe[self.messages_key]
++            .apply(series_to_item)
++            .apply(lambda item: decode_json_list(item, self.messages_key))
++            .tolist()
++        )
+ 
+         # Extract tools list from dataframe
+         if self.tools_key in self.dataframe.columns:
+-            self.tools = self.dataframe[self.tools_key].apply(convert_nested_value_to_list_recursive).tolist()
++            self.tools = (
++                self.dataframe[self.tools_key]
++                .apply(lambda item: decode_json_list(item, self.tools_key, default_empty=True))
++                .tolist()
++            )
+         else:
+             self.tools = None
+         # Extract enable_thinking list from dataframe
+         if self.enable_thinking_key in self.dataframe.columns:
+-            self.enable_thinking = self.dataframe[self.enable_thinking_key].tolist()
++            self.enable_thinking = [
++                False if pd.isna(item) else bool(item)
++                for item in self.dataframe[self.enable_thinking_key].tolist()
++            ]
+         else:
+             self.enable_thinking = None
+ 
+diff --git a/verl/utils/fsdp_utils.py b/verl/utils/fsdp_utils.py
+index 4795a99e..1a4c8f0f 100644
+--- a/verl/utils/fsdp_utils.py
++++ b/verl/utils/fsdp_utils.py
+@@ -565,7 +565,7 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
+     return total_norm
+ 
+ 
+-def layered_summon_lora_params(fsdp_module) -> OrderedDict:
++def layered_summon_lora_params(fsdp_module, adapter_name: str = "default") -> OrderedDict:
+     from peft.utils.save_and_load import get_peft_model_state_dict
+ 
+     def __prefix_submodules(module, prefix):
+@@ -594,7 +594,9 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
+                 continue
+             if fsdp_version(submodule) > 0:
+                 with FSDP.summon_full_params(submodule, writeback=False):
+-                    sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict())
++                    sub_lora_params = get_peft_model_state_dict(
++                        peft_model, state_dict=submodule.state_dict(), adapter_name=adapter_name
++                    )
+                     sub_lora_params = {
+                         f"{prefix}.{name}": param.full_tensor().detach().cpu()
+                         if hasattr(param, "full_tensor")
+diff --git a/verl/utils/vllm/utils.py b/verl/utils/vllm/utils.py
+index acf24398..de2f3ee9 100644
+--- a/verl/utils/vllm/utils.py
++++ b/verl/utils/vllm/utils.py
+@@ -13,6 +13,9 @@
+ # limitations under the License.
+ 
+ 
++import os
++
++import torch
+ from msgspec import field
+ from packaging import version as vs
+ from vllm.lora.models import LoRAModel
+@@ -31,6 +34,10 @@ class TensorLoRARequest(LoRARequest):
+ class VLLMHijack:
+     @staticmethod
+     def hijack():
++        if getattr(LRUCacheWorkerLoRAManager, "_verl_tensor_hijack_installed", False):
++            return
++        original_add_adapter = LRUCacheWorkerLoRAManager.add_adapter
++
+         def hijack__load_adapter(self, lora_request: TensorLoRARequest) -> LoRAModel:
+             """
+             based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors
+@@ -101,6 +108,44 @@ class VLLMHijack:
+                         embedding_padding_modules=self.embedding_padding_modules,
+                         weights_mapper=hf_to_vllm_mapper,
+                     )
++                if (
++                    isinstance(lora_request, TensorLoRARequest)
++                    and os.getenv("LORA_DIAGNOSTICS", "0").lower() in {"1", "true", "yes", "on"}
++                ):
++                    stats = {
++                        "modules": len(lora.loras),
++                        "a_numel": 0,
++                        "b_numel": 0,
++                        "a_nonzero": 0,
++                        "b_nonzero": 0,
++                        "a_max_abs": 0.0,
++                        "b_max_abs": 0.0,
++                    }
++
++                    def iter_tensors(value):
++                        if isinstance(value, torch.Tensor):
++                            yield value
++                        elif isinstance(value, dict):
++                            for item in value.values():
++                                yield from iter_tensors(item)
++                        elif isinstance(value, (list, tuple)):
++                            for item in value:
++                                yield from iter_tensors(item)
++
++                    for weights in lora.loras.values():
++                        for prefix, value in (("a", weights.lora_a), ("b", weights.lora_b)):
++                            for tensor in iter_tensors(value):
++                                stats[f"{prefix}_numel"] += tensor.numel()
++                                stats[f"{prefix}_nonzero"] += int(torch.count_nonzero(tensor).item())
++                                if tensor.numel():
++                                    stats[f"{prefix}_max_abs"] = max(
++                                        stats[f"{prefix}_max_abs"], float(tensor.abs().max().item())
++                                    )
++                    print(
++                        f"[LoRA][vllm-load-diagnostics] name={lora_request.lora_name} "
++                        f"id={lora_request.lora_int_id} rank={lora.rank} stats={stats}",
++                        flush=True,
++                    )
+             except Exception as e:
+                 raise e
+ 
+@@ -111,10 +156,100 @@ class VLLMHijack:
+                 )
+             return lora
+ 
++        def hijack_add_adapter(self, lora_request: LoRARequest) -> bool:
++            """Add an adapter and optionally inspect its active GPU slot."""
++            loaded = original_add_adapter(self, lora_request)
++            if os.getenv("LORA_DIAGNOSTICS", "0").lower() not in {
++                "1",
++                "true",
++                "yes",
++                "on",
++            }:
++                return loaded
++
++            diagnosed = getattr(self, "_verl_diagnosed_active_loras", set())
++            lora_id = lora_request.lora_int_id
++            diagnostic_key = (lora_id, lora_request.lora_name)
++            if diagnostic_key in diagnosed:
++                return loaded
++
++            manager = self._adapter_manager
++            try:
++                slot = manager.lora_index_to_id.index(lora_id)
++            except ValueError:
++                print(
++                    f"[LoRA][vllm-active-diagnostics] name={lora_request.lora_name} "
++                    f"id={lora_id} active_ids={manager.lora_index_to_id} "
++                    "error=adapter_not_in_gpu_slot",
++                    flush=True,
++                )
++                return loaded
++
++            stats = {
++                "modules": 0,
++                "a_tensors": 0,
++                "b_tensors": 0,
++                "a_numel": 0,
++                "b_numel": 0,
++                "a_nonzero": 0,
++                "b_nonzero": 0,
++                "a_nonfinite": 0,
++                "b_nonfinite": 0,
++                "a_max_abs": 0.0,
++                "b_max_abs": 0.0,
++            }
++
++            def update_stats(prefix, value):
++                values = value if isinstance(value, (list, tuple)) else (value,)
++                for tensor in values:
++                    if not isinstance(tensor, torch.Tensor):
++                        continue
++                    active = tensor[slot]
++                    stats[f"{prefix}_tensors"] += 1
++                    stats[f"{prefix}_numel"] += active.numel()
++                    stats[f"{prefix}_nonzero"] += int(torch.count_nonzero(active).item())
++                    stats[f"{prefix}_nonfinite"] += int(
++                        torch.count_nonzero(~torch.isfinite(active)).item()
++                    )
++                    if active.numel():
++                        finite = active[torch.isfinite(active)]
++                        if finite.numel():
++                            stats[f"{prefix}_max_abs"] = max(
++                                stats[f"{prefix}_max_abs"],
++                                float(finite.abs().max().item()),
++                            )
++
++            for module in manager.modules.values():
++                stats["modules"] += 1
++                update_stats("a", module.lora_a_stacked)
++                update_stats("b", module.lora_b_stacked)
++
++            print(
++                f"[LoRA][vllm-active-diagnostics] name={lora_request.lora_name} "
++                f"id={lora_id} slot={slot} active_ids={manager.lora_index_to_id} "
++                f"stats={stats}",
++                flush=True,
++            )
++            if (
++                os.getenv("LORA_DIAGNOSTICS_EXPECT_ZERO", "0").lower()
++                in {"1", "true", "yes", "on"}
++                and stats["b_nonzero"] != 0
++            ):
++                raise RuntimeError(
++                    f"Active vLLM LoRA B is not zero for "
++                    f"{lora_request.lora_name!r}: {stats}"
++                )
++
++            diagnosed.add(diagnostic_key)
++            self._verl_diagnosed_active_loras = diagnosed
++            return loaded
++
+         def do_hijack(target_cls, target_method_name, hooking_method):
+             setattr(target_cls, target_method_name, hooking_method)
+ 
+         do_hijack(LRUCacheWorkerLoRAManager, "_load_adapter", hijack__load_adapter)
++        do_hijack(LRUCacheWorkerLoRAManager, "add_adapter", hijack_add_adapter)
++        LRUCacheWorkerLoRAManager._verl_tensor_hijack_installed = True
+ 
+ 
+ def is_version_ge(pkg: str = "vllm", minver: str = "0.7.3"):
