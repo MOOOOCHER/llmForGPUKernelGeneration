@@ -78,7 +78,7 @@ mkdir -p "${VLLM_CONFIG_ROOT}" "${TRANSFORMERS_CACHE}"
 
 # ==== TUNABLES ============================================================
 KB_LEVEL="${KB_LEVEL:-1}"
-EVAL_DATASET="${EVAL_DATASET:-${REPO_ROOT}/Results/Kernelbench/kernelgym_datasets/kernelbench_level${KB_LEVEL}_for_kernelgym.parquet}"
+EVAL_DATASET="${EVAL_DATASET:-${EVAL_PIPELINE_ROOT}/datasets/kernelbench_level${KB_LEVEL}_for_kernelgym.parquet}"
 
 MODEL_PATH="${MODEL_PATH:-${REPO_ROOT}/models/drkernel-8b}"
 MODEL_NAME="${MODEL_NAME:-drkernel-8b}"

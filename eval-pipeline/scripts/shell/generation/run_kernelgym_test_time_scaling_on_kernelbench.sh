@@ -22,7 +22,7 @@ RUN_NAME="${RUN_NAME:-kernelbench_tts_smoke}"
 PROJECT_NAME="${PROJECT_NAME:-kernelgym-kernelbench-tts}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$RUN_NAME}"
 
-EVAL_DATASET="${EVAL_DATASET:-$WORKSPACE_ROOT/Results/Kernelbench/kernelgym_datasets_smoke/kernelbench_level1_for_kernelgym.parquet}"
+EVAL_DATASET="${EVAL_DATASET:-${EVAL_PIPELINE_ROOT:-${KERNELGYM_ROOT}/eval-pipeline}/datasets/kernelbench_level1_for_kernelgym.parquet}"
 OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE_ROOT/Results/Kernelbench/tts_runs/$RUN_NAME}"
 OUTPUT_PATH="${OUTPUT_PATH:-$OUTPUT_DIR/graded_results.parquet}"
 METRICS_OUTPUT_PATH="${METRICS_OUTPUT_PATH:-$OUTPUT_DIR/metrics.json}"

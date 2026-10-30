@@ -1,0 +1,36 @@
+{
+  "created_at": "2026-07-17T15:47:02.586520+00:00",
+  "script": "eval-pipeline/scripts/python/datasets/build_kernelbench_for_kernelgym.py",
+  "kernelbench_root": "kernelbench",
+  "output_dir": "eval-pipeline/datasets",
+  "levels": [
+    1,
+    2,
+    3
+  ],
+  "per_level_counts": {
+    "1": 100,
+    "2": 100,
+    "3": 50
+  },
+  "total_rows": 250,
+  "output_files": [
+    "eval-pipeline/datasets/kernelbench_level1_for_kernelgym.parquet",
+    "eval-pipeline/datasets/kernelbench_level2_for_kernelgym.parquet",
+    "eval-pipeline/datasets/kernelbench_level3_for_kernelgym.parquet"
+  ],
+  "combined_output": "eval-pipeline/datasets/kernelbench_all_levels_for_kernelgym.parquet",
+  "parameters": {
+    "backend": "triton",
+    "prompt_option": "one_shot",
+    "custom_prompt_key": null,
+    "precision": "fp32",
+    "include_hardware": false,
+    "gpu_name": null,
+    "entry_point": "Model",
+    "problem_ids": null,
+    "id_range": null,
+    "max_problems": null
+  },
+  "path_base": "repository_root"
+}

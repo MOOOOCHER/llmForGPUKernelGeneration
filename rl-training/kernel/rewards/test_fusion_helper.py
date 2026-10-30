@@ -331,69 +331,52 @@ class ModelNew:
 
         self.assertEqual(len(boundaries), 2)
 
-    def test_generated_parse_failure_is_neutral(self):
+    def test_source_parse_failure_does_not_block_profiled_reward(self):
         with patch.object(
-            FUSION_HELPER,
-            "analyze_fusion_source",
-            side_effect=[({}, [CHAIN_PLAN]), ValueError("bad generated source")],
-        ):
+            FUSION_HELPER, "analyze_fusion_source",
+            side_effect=ValueError("source is not parseable"),
+        ) as analyze:
             result = compute_fusion_reward(
-                "reference",
-                "generated",
-                resolved_weight=0.3,
-                unresolved_weight=-0.1,
-                detector="ast",
+                "reference", "generated", correctness=True, speedup=2.0,
+                profiler_metadata={
+                    "reference_profiling": {"kernel_launch_count": 3},
+                    "profiling": {"kernel_launch_count": 1},
+                },
             )
+        analyze.assert_not_called()
+        self.assertEqual(result["compression_gain"], 1.0)
+        self.assertEqual(result["fusion_reward"], 1.0)
+        self.assertIsNone(result["fusion_error"])
 
-        self.assertEqual(result["fusion_proven_fused_count"], 0)
-        self.assertEqual(result["fusion_not_proven_fused_count"], 2)
-        self.assertEqual(result["fusion_unknown_count"], 2)
-        self.assertAlmostEqual(result["fusion_reward"], 0.0)
-        self.assertIn("generated plan generation failed", result["fusion_error"])
+    def test_source_boundaries_do_not_override_profiled_launch_counts(self):
+        with patch.object(FUSION_HELPER, "analyze_fusion_source") as analyze:
+            result = compute_fusion_reward(
+                "reference", "generated", correctness=True, speedup=2.0,
+                profiler_metadata={
+                    "reference_profiling": {"kernel_launch_count": 3},
+                    "profiling": {"kernel_launch_count": 3},
+                },
+            )
+        analyze.assert_not_called()
+        self.assertEqual(result["compression_gain"], 0.0)
+        self.assertEqual(result["fusion_reward"], 0.0)
 
-    def test_only_explicit_not_fused_boundaries_are_penalized(self):
-        generated_graph = graph(
-            [custom_node("g0"), custom_node("g1"), visible_node("g2", "sum")]
+    def test_reward_metadata_records_profiled_launch_counts(self):
+        result = compute_fusion_reward(
+            "reference", "generated", correctness=True, speedup=1.0,
+            profiler_metadata={
+                "reference_profiling": {"kernel_launch_count": 3},
+                "profiling": {"kernel_launch_count": 1},
+            },
         )
-        with patch.object(
-            FUSION_HELPER,
-            "analyze_fusion_source",
-            side_effect=[({}, [CHAIN_PLAN]), (generated_graph, [])],
-        ):
-            result = compute_fusion_reward(
-                "reference",
-                "generated",
-                resolved_weight=0.3,
-                unresolved_weight=-0.1,
-                detector="ast",
-            )
-
-        self.assertEqual(result["fusion_not_fused_count"], 2)
-        self.assertAlmostEqual(result["fusion_reward"], -0.1)
-
-    def test_reward_metadata_uses_proven_fused_names_only(self):
-        with patch.object(
-            FUSION_HELPER,
-            "analyze_fusion_source",
-            side_effect=[({}, [CHAIN_PLAN]), (graph([custom_node("g0")]), [])],
-        ):
-            result = compute_fusion_reward(
-                "reference", "generated", detector="ast"
-            )
-
-        legacy_keys = {
-            "fusion_resolved_ratio",
-            "fusion_unresolved_ratio",
-            "fusion_resolved_count",
-            "fusion_unresolved_count",
-            "fusion_resolved_plans",
-            "fusion_unresolved_plans",
-            "fusion_resolved_anchor_count",
-        }
+        self.assertEqual(result["fusion_detector"], "profiler_launches")
+        self.assertEqual(result["compression_reference_launches"], 3)
+        self.assertEqual(result["compression_generated_launches"], 1)
+        self.assertEqual(result["compression_gain"], 1.0)
+        self.assertEqual(result["fusion_plan_artifact"]["fusion_reward"], 0.5)
+        legacy_keys = {"fusion_resolved_ratio", "fusion_unresolved_ratio",
+                       "fusion_proven_fused_ratio", "fusion_not_proven_fused_ratio"}
         self.assertTrue(legacy_keys.isdisjoint(result))
-        self.assertIn("fusion_proven_fused_ratio", result)
-        self.assertIn("fusion_not_proven_fused_ratio", result)
-        self.assertIn("fusion_proven_fused_anchor_count", result)
 
     def test_profiled_export_combines_name_and_visible_anchor(self):
         generated_graph = graph(
@@ -1012,58 +995,41 @@ class ModelNew:
         self.assertEqual(boundaries[0]["status"], "not_fused")
 
     def test_incorrect_kernel_skips_profiled_export(self):
-        with patch.object(
-            ProfiledExportFusionDetector, "detect"
-        ) as detector:
+        with patch.object(ProfiledExportFusionDetector, "detect") as detector:
             result = compute_fusion_reward(
-                "reference",
-                "generated",
-                correctness=False,
-                detector="profiled_export",
+                "reference", "generated", correctness=False,
+                profiler_metadata={
+                    "reference_profiling": {"kernel_launch_count": 3},
+                    "profiling": {"kernel_launch_count": 1},
+                },
             )
-
         detector.assert_not_called()
-        self.assertEqual(result["fusion_skipped_reason"], "incorrect_kernel")
-        self.assertEqual(
-            result["fusion_plan_artifact"]["skipped_reason"],
-            "incorrect_kernel",
-        )
+        self.assertEqual(result["compression_skipped_reason"], "incorrect_kernel")
+        self.assertEqual(result["fusion_reward"], 0.0)
+        self.assertIsNone(result["fusion_plan_artifact"])
 
     def test_export_failure_returns_unknown_boundaries(self):
         with patch.object(
-            FUSION_HELPER,
-            "reference_fusion_context",
-            return_value={
-                "fusion_plans": [CHAIN_PLAN],
-                "lifted_graph": {"lifted_nodes": [], "edges": []},
-                "analysis_mode": "export",
-                "export_error": None,
-            },
+            FUSION_HELPER, "_export_reference_lifted_graph",
+            return_value=({"lifted_nodes": [], "edges": []}, {"mode": "export"}),
         ), patch.object(
-            FUSION_HELPER,
-            "_export_generated_lifted_graph",
+            FUSION_HELPER, "_export_generated_lifted_graph",
             side_effect=RuntimeError("not exportable"),
         ):
             result = ProfiledExportFusionDetector().detect(
                 FusionDetectionContext(
-                    reference_code="reference",
-                    kernel_code="generated",
+                    reference_code="reference", kernel_code="generated",
                     correctness=True,
+                    sample_extra_info={"operators": ["relu", "add", "sum"]},
                 )
             )
-
         self.assertEqual(len(result.boundaries), 2)
-        self.assertTrue(
-            all(item["status"] == "unknown" for item in result.boundaries)
-        )
-        self.assertTrue(
-            all(
-                item["unknown_reason"] == "export_failure"
-                for item in result.boundaries
-            )
-        )
+        self.assertTrue(all(item["status"] == "unknown" for item in result.boundaries))
+        self.assertTrue(all(item["unknown_reason"] == "export_failure"
+                            for item in result.boundaries))
         self.assertIsNotNone(result.reference_graph)
         self.assertIsNone(result.generated_graph)
+        self.assertIn("not exportable", result.error)
 
     def test_generated_export_failure_uses_ast_graph_fallback(self):
         ast_graph = graph(

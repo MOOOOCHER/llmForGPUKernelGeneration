@@ -58,7 +58,7 @@ EVAL_SCRIPTS="${EVAL_PIPELINE_ROOT:-${KERNELGYM_ROOT}/eval-pipeline}/scripts"
 : "${RUN_GROUP:?set RUN_GROUP (base name of the TTS runs, without _level<L>)}"
 KB_LEVELS="${KB_LEVELS:-1,2,3}"
 TTS_RUNS_ROOT="${TTS_RUNS_ROOT:-${REPO_ROOT}/Results/Kernelbench/tts_runs}"
-DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/Results/Kernelbench/kernelgym_datasets}"
+DATASET_DIR="${DATASET_DIR:-${EVAL_PIPELINE_ROOT:-${KERNELGYM_ROOT}/eval-pipeline}/datasets}"
 # best_correct = correctness first, then measured TTS speedup; the other
 # choices are best_score / best_compiled / last (see the exporter).
 EXPORT_SELECT="${EXPORT_SELECT:-best_correct_or_compiled}"

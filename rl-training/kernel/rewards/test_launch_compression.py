@@ -70,17 +70,13 @@ class LaunchCompressionRewardTest(unittest.TestCase):
         self.assertEqual(result["compression_speed_factor"], 0.99)
         self.assertEqual(result["fusion_reward"], 0.495)
 
-    def test_above_one_speedup_uses_clipped_magnitude(self):
+    def test_above_one_speedup_is_capped_at_three(self):
         result = compute_fusion_reward(
-            "",
-            "",
-            correctness=True,
-            speedup=9.0,
-            fusion_weight=0.5,
+            "", "", correctness=True, speedup=9.0, fusion_weight=0.5,
             profiler_metadata=metadata(4, 1),
         )
-        self.assertEqual(result["compression_speed_factor"], 1.0)
-        self.assertEqual(result["fusion_reward"], 0.5)
+        self.assertEqual(result["compression_speed_factor"], 3.0)
+        self.assertEqual(result["fusion_reward"], 1.5)
 
     def test_incorrect_and_missing_profiles_are_neutral(self):
         incorrect = compute_fusion_reward(

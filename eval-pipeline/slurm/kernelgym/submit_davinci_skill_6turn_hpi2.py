@@ -10,9 +10,9 @@ ROOT = Path('/.gpfs/scratch/zongxiong.chen/daniel')
 sys.path.insert(0, str(ROOT / 'slurm/kernelgym'))
 import davinci_skill_eval_chain as chain
 
-SOURCE = ROOT / 'Results/Kernelbench/chain_manifests/kbtts_davinci_joint_rl_final2713752_skills_3x3_20261022'
+SOURCE = ROOT / 'Results/Kernelbench/_support/chain_manifests/kbtts_davinci_joint_rl_final2713752_skills_3x3_20261022'
 GROUP = 'kbtts_davinci_joint_step84_skills_3traj6turn_20261023'
-DEST = ROOT / 'Results/Kernelbench/chain_manifests' / GROUP
+DEST = ROOT / 'Results/Kernelbench/_support/chain_manifests' / GROUP
 ADAPTER = ROOT / 'slurm/kernelgym/davinci_skill_eval_chain.sbatch'
 manifest = chain.read(SOURCE / 'chain_manifest.json')
 config = chain.read(SOURCE / 'chain_config.json')

@@ -225,7 +225,7 @@ class PPOBatchFilter:
         n_groups = len(unique_uids)
 
         if total_samples == 0:
-            self._log_empty_batch_warning()
+            logger.warning("Received an empty batch; returning no selected samples")
             empty_indices = torch.tensor([], dtype=torch.long)
             empty_metrics = {
                 'batch/total_samples_generated': 0,

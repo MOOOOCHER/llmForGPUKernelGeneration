@@ -34,10 +34,9 @@ DEFAULT_KERNELBENCH_ROOT = KERNELGYM_ROOT / "kernelbench"
 DEFAULT_OUTPUT_ROOT = DEFAULT_KERNELBENCH_ROOT / "runs"
 DEFAULT_RUN_ROOT = WORKSPACE_ROOT / "Results" / "Kernelbench" / "tts_runs"
 DEFAULT_DATASET = (
-    WORKSPACE_ROOT
-    / "Results"
-    / "Kernelbench"
-    / "kernelgym_datasets"
+    KERNELGYM_ROOT
+    / "eval-pipeline"
+    / "datasets"
     / "kernelbench_level1_for_kernelgym.parquet"
 )
 

@@ -37,8 +37,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DEFRAG_ROOT = Path(__file__).resolve().parents[4] / "archive" / "DefragmentationFramework"
 _DEFAULT_REFERENCE_CACHE_ROOT = (
     Path(__file__).resolve().parents[4]
-    / "Results"
-    / "RL-Training"
+    / ".cache"
     / "reference_fusion_cache"
 )
 _REFERENCE_CONTEXT_VERSION = "reference-export-v5-scoped-library-anchors"

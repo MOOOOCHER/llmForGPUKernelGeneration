@@ -90,47 +90,27 @@ class FullProgramPlanTest(unittest.TestCase):
         self.assertEqual(reason, "operator_chain_too_short")
 
     def test_fusion_reward_scales_sub_one_speedup(self):
-        detection = FUSION_HELPER.FusionDetectionResult(
-            detector="profiled_export",
-            reference_plans=[{"semantics": ["relu", "sigmoid"]}],
-            plan_alignments=[{"execution_group_counts": [1]}],
+        result = FUSION_HELPER.compute_fusion_reward(
+            "reference", "generated", fusion_weight=0.5, speedup=0.5,
+            correctness=True,
+            profiler_metadata={
+                "reference_profiling": {"kernel_launch_count": 2},
+                "profiling": {"kernel_launch_count": 1},
+            },
         )
-        with patch.object(
-            FUSION_HELPER.ProfiledExportFusionDetector,
-            "detect",
-            return_value=detection,
-        ):
-            result = FUSION_HELPER.compute_fusion_reward(
-                "reference",
-                "generated",
-                fusion_weight=0.5,
-                speedup=0.5,
-                correctness=True,
-            )
-
         self.assertAlmostEqual(result["compression_gain"], 1.0)
         self.assertAlmostEqual(result["compression_speed_factor"], 0.5)
         self.assertAlmostEqual(result["fusion_reward"], 0.25)
 
     def test_fusion_reward_caps_speedup_at_three(self):
-        detection = FUSION_HELPER.FusionDetectionResult(
-            detector="profiled_export",
-            reference_plans=[{"semantics": ["relu", "sigmoid"]}],
-            plan_alignments=[{"execution_group_counts": [1]}],
+        result = FUSION_HELPER.compute_fusion_reward(
+            "reference", "generated", fusion_weight=0.5, speedup=5.0,
+            correctness=True,
+            profiler_metadata={
+                "reference_profiling": {"kernel_launch_count": 2},
+                "profiling": {"kernel_launch_count": 1},
+            },
         )
-        with patch.object(
-            FUSION_HELPER.ProfiledExportFusionDetector,
-            "detect",
-            return_value=detection,
-        ):
-            result = FUSION_HELPER.compute_fusion_reward(
-                "reference",
-                "generated",
-                fusion_weight=0.5,
-                speedup=5.0,
-                correctness=True,
-            )
-
         self.assertAlmostEqual(result["compression_speed_factor"], 3.0)
         self.assertAlmostEqual(result["fusion_reward"], 1.5)
 

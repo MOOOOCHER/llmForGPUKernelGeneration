@@ -31,7 +31,7 @@ from typing import Any
 KERNELGYM_ROOT = Path(__file__).resolve().parents[4]
 WORKSPACE_ROOT = KERNELGYM_ROOT.parent
 DEFAULT_KERNELBENCH_ROOT = KERNELGYM_ROOT / "kernelbench"
-DEFAULT_OUTPUT_DIR = WORKSPACE_ROOT / "Results" / "Kernelbench" / "kernelgym_datasets"
+DEFAULT_OUTPUT_DIR = KERNELGYM_ROOT / "eval-pipeline" / "datasets"
 
 
 def add_kernelbench_to_path(kernelbench_root: Path) -> None:
@@ -202,14 +202,15 @@ def write_metadata(
 ) -> Path:
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "script": os.path.relpath(__file__, WORKSPACE_ROOT),
-        "kernelbench_root": os.path.relpath(args.kernelbench_root, WORKSPACE_ROOT),
-        "output_dir": os.path.relpath(args.output_dir, WORKSPACE_ROOT),
+        "path_base": "repository_root",
+        "script": os.path.relpath(__file__, KERNELGYM_ROOT),
+        "kernelbench_root": os.path.relpath(args.kernelbench_root, KERNELGYM_ROOT),
+        "output_dir": os.path.relpath(args.output_dir, KERNELGYM_ROOT),
         "levels": args.levels,
         "per_level_counts": per_level_counts,
         "total_rows": sum(per_level_counts.values()),
-        "output_files": [os.path.relpath(path, WORKSPACE_ROOT) for path in output_files],
-        "combined_output": os.path.relpath(combined_output, WORKSPACE_ROOT) if combined_output else None,
+        "output_files": [os.path.relpath(path, KERNELGYM_ROOT) for path in output_files],
+        "combined_output": os.path.relpath(combined_output, KERNELGYM_ROOT) if combined_output else None,
         "parameters": {
             "backend": args.backend,
             "prompt_option": args.prompt_option,

@@ -42,6 +42,12 @@ historical H100 baseline timing files remain in the HPI workspace. Override
 `BASELINE_DIR` to select another set of reference timings; paired eager and
 compiled timings from the current evaluation take precedence.
 
+The benchmark inputs are bundled in `eval-pipeline/datasets/`: 100 Level 1,
+100 Level 2, and 50 Level 3 problems, plus a combined 250-problem file.
+They use FP32, Triton, and the `one_shot` prompt. The pipeline uses these
+files by default; set `DATASET_DIR` to use a different input directory.
+The JSON metadata records the generation settings and repository-relative paths.
+
 For a small test, build an original-problem subset with
 `python eval-pipeline/scripts/python/datasets/build_kernelbench_for_kernelgym.py --levels 1 --problem-ids 88 --no-combined --output-dir /path/to/test-dataset`.
 Then set `DATASET_DIR` to that folder, `KB_LEVELS=1`, `KB_PROBLEM_IDS=88`,
@@ -52,6 +58,7 @@ The same entry point runs generation, export, evaluation, and subset metrics.
 ## Layout and outputs
 
 ```text
+datasets/       Benchmark Parquet inputs and generation metadata
 scripts/python/  datasets/, export/, analysis/, validation/
 scripts/shell/   submission/, generation/, evaluation/
 slurm/          Cluster launchers and campaign-specific helpers

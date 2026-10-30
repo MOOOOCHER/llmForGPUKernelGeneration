@@ -19,21 +19,6 @@ import sys
 import torch
 
 
-# Mock verl module to avoid import errors
-class MockVerl:
-    class utils:
-        class torch_functional:
-            @staticmethod
-            def masked_mean(tensor, mask, dim=None):
-                if dim is None:
-                    return (tensor * mask).sum() / mask.sum()
-                return (tensor * mask).sum(dim=dim) / mask.sum(dim=dim)
-
-
-sys.modules['verl'] = MockVerl()
-sys.modules['verl.utils'] = MockVerl.utils
-sys.modules['verl.utils.torch_functional'] = MockVerl.utils.torch_functional
-
 from verl_patch.trainer.code.filters import PPOBatchFilter, PPOFilterConfig
 
 # ============================================================================
@@ -129,60 +114,27 @@ def test_filter_group_order_reproducibility():
 
 
 def test_subprocess_determinism():
-    """Test determinism across different subprocess runs (simulating different machines)."""
-    print("\n" + "=" * 70)
-    print("TEST: Cross-subprocess determinism")
-    print("=" * 70)
-
+    """Require deterministic selection across independent Python processes."""
     test_code = """
 import torch
-import sys
-sys.path.insert(0, '/Users/bytedance/code/verl_patch')
-
-try:
-    from verl_patch.trainer.code.filters import PPOBatchFilter, PPOFilterConfig
-
-    config = PPOFilterConfig(
-        sample_selection_strategy="uniform",
-        target_group_size=4,
-        reject_low_variance_groups=False,
-    )
-
-    batch_data = {
-        'rewards': torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]),
-        'response_lengths': torch.tensor([100] * 12),
-        'response_mask': torch.ones(12, 100, dtype=torch.bool),
-    }
-
-    uids = ['group_A'] * 4 + ['group_B'] * 4 + ['group_C'] * 4
-
-    filter = PPOBatchFilter(config, data_config={'seed': 42})
-    selected_indices, _ = filter.filter_batch(batch_data, uids, return_indices=True)
-    print(selected_indices.tolist())
-except Exception as e:
-    print(f"ERROR: {e}", file=sys.stderr)
-    sys.exit(1)
+from verl_patch.trainer.code.filters import PPOBatchFilter, PPOFilterConfig
+config = PPOFilterConfig(sample_selection_strategy="uniform", target_group_size=4,
+                         reject_low_variance_groups=False)
+batch_data = {
+    'rewards': torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]),
+    'response_lengths': torch.tensor([100] * 12),
+    'response_mask': torch.ones(12, 100, dtype=torch.bool),
+}
+uids = ['group_A'] * 4 + ['group_B'] * 4 + ['group_C'] * 4
+filter = PPOBatchFilter(config, data_config={'seed': 42})
+selected_indices, _ = filter.filter_batch(batch_data, uids, return_indices=True)
+print(selected_indices.tolist())
 """
-
-    # Run in 3 separate subprocesses
-    results = []
-    for i in range(3):
-        try:
-            result = subprocess.run([sys.executable, '-c', test_code], capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                results.append(result.stdout.strip())
-        except Exception as e:
-            print(f"  Subprocess {i+1} skipped: {e}")
-            return True  # Skip this test if subprocess fails
-
-    if results and len(results) >= 2:
-        print(f"  Process 1 result: {results[0]}")
-        assert all(r == results[0] for r in results), "Should be identical across processes"
-        print("✅ PASS: Results identical across subprocesses")
-    else:
-        print("⊘ SKIP: Subprocess test not applicable")
-
-    return True
+    results = [subprocess.run([sys.executable, '-c', test_code], check=True,
+                              capture_output=True, text=True, timeout=60).stdout.strip()
+               for _ in range(3)]
+    assert results[0], "Subprocess must emit the selected indices"
+    assert all(result == results[0] for result in results)
 
 
 # ============================================================================
@@ -344,13 +296,16 @@ def test_group_level_length_filtering():
         sample_selection_strategy="uniform",
         target_group_size=4,
         max_response_length=150,
+        remove_clip=True,
     )
     filter = PPOBatchFilter(config)
 
     batch_data = {
         'rewards': torch.tensor([0.5, 0.6, 0.7, 0.8, 0.4, 0.3, 0.2, 0.1]),
         'response_lengths': torch.tensor([100, 200, 120, 180, 160, 170, 180, 190]),
-        'response_mask': torch.ones(8, 100, dtype=torch.bool),
+        'response_mask': torch.arange(200)[None, :] < torch.tensor(
+            [100, 200, 120, 180, 160, 170, 180, 190]
+        )[:, None],
     }
     uids = ['uid_0'] * 4 + ['uid_1'] * 4  # uid_0: mixed lengths, uid_1: all > 150
 
